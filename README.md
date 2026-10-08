@@ -4,10 +4,11 @@ A small Docker service that keeps the newest N videos from each configured chann
 
 ## Features
 
-- Downloads the newest N videos on startup.
-- Polls each channel periodically for new uploads.
+- Starts **paused** on first run; nothing downloads until you unpause it.
+- Downloads the newest N videos per channel, where N is set per channel.
+- Polls each channel periodically for new uploads (channels with N=0 are skipped).
 - Deletes older downloads so each channel retains only its newest N.
-- SQLite state database prevents duplicate downloads.
+- Channels, settings, and download state are stored in a SQLite database.
 - Saves videos as `ChannelName-PostDate-VideoTitle-VideoID.mp4` (the ID suffix makes
   filename collisions impossible).
 - Limits source video to 1080p maximum and prefers H.264/AVC `avc1`, then H.265/HEVC `hvc1`.
@@ -17,13 +18,13 @@ A small Docker service that keeps the newest N videos from each configured chann
 
 ## Quick start
 
-1. Edit `config/channels.yml`.
-2. Set `LATEST_N` and `POLL_MINUTES` in `docker-compose.yml` if desired.
-3. Start:
+1. Start:
 
 ```bash
 docker compose up -d --build
 ```
+
+2. Add a channel and unpause the archiver (see [Channels & settings](#channels--settings)).
 
 Videos appear under `./data/videos/`; the SQLite database is `./data/archive.db`.
 
@@ -51,24 +52,33 @@ The downloader deliberately rejects VP9 and AV1 video streams and applies a hard
 
 The service does not attempt to convert an incompatible video. If a video has no compatible `hvc1` or `avc1` MP4 stream, that video is logged as failed and retried on a later polling cycle.
 
-## Per-channel retention
+## Channels & settings
 
-You can configure a global default:
+Channels and runtime settings live in the SQLite database (`./data/archive.db`),
+not in a YAML file. The database starts with **no channels**, and the archiver
+starts **paused**, so nothing downloads until you add a channel and unpause it.
 
-```yaml
-# docker-compose.yml
-LATEST_N: "25"
+A web UI for managing channels and settings is on the roadmap. Until it lands,
+manage state with any SQLite tool against `./data/archive.db` (the `./data`
+directory is a host mount):
+
+```sql
+-- Add a channel: url + how many recent videos to keep (N)
+INSERT OR IGNORE INTO channels (url, latest_n, added_at)
+VALUES ('https://www.youtube.com/@yourchannel', 10, datetime('now'));
+
+-- Unpause the archiver (takes effect within ~30 s, no restart needed)
+UPDATE settings SET value = '0' WHERE key = 'paused';
 ```
 
-Or override it per channel:
+Accepted channel URL formats: `@handle`, `https://www.youtube.com/@handle`,
+`https://www.youtube.com/channel/UC...`.
 
-```yaml
-channels:
-  - url: "https://www.youtube.com/@channel-one"
-    latest_n: 25
-  - url: "https://www.youtube.com/@channel-two"
-    latest_n: 5
-```
+### Per-channel retention
+
+Each channel stores its own `latest_n` in the `channels` table — there is no
+global default. A channel with `latest_n = 0` is skipped by the scheduled poll;
+it only keeps videos that are explicitly protected.
 
 ## Notes
 

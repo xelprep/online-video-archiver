@@ -4,13 +4,11 @@ services:
     container_name: online-video-archiver
     restart: unless-stopped
     environment:
-      LATEST_N: "10"
+      # Initial defaults only; runtime settings live in the SQLite settings table.
       POLL_MINUTES: "30"
       LOG_LEVEL: "INFO"
       DATA_DIR: "/data"
-      CONFIG_PATH: "/config/channels.yml"
     ports:
       - "8080:8080"
     volumes:
-      - ./config:/config:ro
       - ./data:/data

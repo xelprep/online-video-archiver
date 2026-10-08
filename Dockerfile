@@ -16,7 +16,7 @@ COPY app/ ./
 
 # Run as an unprivileged user; /data is the only writable path the app needs.
 RUN useradd --create-home appuser \
-    && mkdir -p /data /config \
+    && mkdir -p /data \
     && chown appuser:appuser /data
 USER appuser
 

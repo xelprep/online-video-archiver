@@ -1,7 +1,0 @@
-# Each entry may be a plain channel URL, or a mapping with its own retention count.
-# latest_n overrides LATEST_N for that channel.
-channels:
-  - url: "https://www.youtube.com/@ExampleChannel"
-    latest_n: 10
-  # - url: "https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx"
-  #   latest_n: 20

@@ -1,5 +1,4 @@
 import contextlib
-import json
 import logging
 import os
 import re
@@ -9,21 +8,23 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yaml
 from flask import Flask, jsonify
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VIDEO_DIR = DATA_DIR / "videos"
 DB_PATH = DATA_DIR / "archive.db"
-CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config/channels.yml"))
-POLL_MINUTES = max(1, int(os.getenv("POLL_MINUTES", "30")))
-DEFAULT_N = max(1, int(os.getenv("LATEST_N", "10")))
+# Env vars provide *initial defaults only*; once the settings table holds a
+# value, it is the source of truth at runtime (B3).
+POLL_MINUTES_DEFAULT = max(1, int(os.getenv("POLL_MINUTES", "30")))
+LOG_LEVEL_DEFAULT = os.getenv("LOG_LEVEL", "INFO").upper()
+# How often the worker re-checks the paused flag while paused.
+PAUSE_POLL_SECONDS = 30
 TZ = timezone.utc
 
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL_DEFAULT,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("yt-archiver")
@@ -61,33 +62,75 @@ def init_db():
             upload_date TEXT,
             filepath TEXT NOT NULL,
             downloaded_at TEXT NOT NULL,
+            protected INTEGER NOT NULL DEFAULT 0,
             UNIQUE(channel_url, video_id)
         );
         CREATE INDEX IF NOT EXISTS idx_videos_channel_date
           ON videos(channel_url, upload_date, downloaded_at);
+        CREATE TABLE IF NOT EXISTS channels (
+            url TEXT PRIMARY KEY,
+            name TEXT,
+            latest_n INTEGER NOT NULL,
+            added_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
+        migrate(conn)
 
 
-def load_config():
-    if not CONFIG_PATH.exists():
-        raise FileNotFoundError(f"Missing config: {CONFIG_PATH}")
-    with CONFIG_PATH.open("r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f) or {}
-    channels = cfg.get("channels", [])
-    if not isinstance(channels, list):
-        raise ValueError("channels must be a list")
-    normalized = []
-    for item in channels:
-        if isinstance(item, str):
-            normalized.append({"url": item, "latest_n": DEFAULT_N})
-        elif isinstance(item, dict) and item.get("url"):
-            normalized.append({
-                "url": str(item["url"]).strip(),
-                "latest_n": max(1, int(item.get("latest_n", DEFAULT_N))),
-            })
-        else:
-            raise ValueError(f"Invalid channel entry: {item!r}")
-    return normalized
+def migrate(conn):
+    # One-time upgrades for databases created by older versions.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
+    if "protected" not in cols:
+        conn.execute("ALTER TABLE videos ADD COLUMN protected INTEGER NOT NULL DEFAULT 0")
+
+
+def get_setting(key, default=None):
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row is not None else default
+
+
+def set_setting(key, value):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+
+
+def seed_settings():
+    # Insert defaults only for keys that do not exist yet, so env-provided
+    # initial values never overwrite a user's later changes (B3).
+    defaults = {
+        "paused": "1",  # B5: a fresh deploy starts paused
+        "poll_minutes": str(POLL_MINUTES_DEFAULT),
+        "log_level": LOG_LEVEL_DEFAULT,
+    }
+    with db() as conn:
+        for key, value in defaults.items():
+            conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def is_paused():
+    return get_setting("paused", "1") == "1"
+
+
+def apply_log_level():
+    try:
+        logging.getLogger().setLevel(str(get_setting("log_level", "INFO")).upper())
+    except ValueError:
+        pass
+
+
+def load_channels():
+    with db() as conn:
+        rows = conn.execute("SELECT url, name, latest_n FROM channels ORDER BY url").fetchall()
+    return [dict(r) for r in rows]
 
 
 def safe_filename(value, max_len=180):
@@ -269,12 +312,17 @@ def sync_channel(channel_url, latest_n):
 
 
 def sync_all():
+    if is_paused():
+        log.info("Archiver is paused; skipping sync")
+        return
     if not lock.acquire(blocking=False):
         log.info("Sync already running; skipping overlapping cycle")
         return
     try:
-        channels = load_config()
-        for ch in channels:
+        for ch in load_channels():
+            if ch["latest_n"] <= 0:
+                # C8: channels with N=0 are skipped during the scheduled poll.
+                continue
             try:
                 sync_channel(ch["url"], ch["latest_n"])
             except Exception:
@@ -285,23 +333,38 @@ def sync_all():
 
 def worker():
     while True:
+        paused = is_paused()
+        apply_log_level()
         started = time.monotonic()
         try:
             sync_all()
         except Exception:
             log.exception("Sync cycle failed")
         elapsed = time.monotonic() - started
-        sleep_for = max(5, POLL_MINUTES * 60 - elapsed)
-        time.sleep(sleep_for)
+        if paused:
+            # Re-check the flag frequently so an unpause takes effect quickly.
+            time.sleep(PAUSE_POLL_SECONDS)
+            continue
+        try:
+            poll_minutes = max(1, int(get_setting("poll_minutes", "30")))
+        except (TypeError, ValueError):
+            poll_minutes = POLL_MINUTES_DEFAULT
+        time.sleep(max(5, poll_minutes * 60 - elapsed))
 
 
 @app.get("/health")
 def health():
     try:
-        channels = load_config()
         with db() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
-        return jsonify({"status": "ok", "version": APP_VERSION, "channels": len(channels), "tracked_videos": count})
+            channels = conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0]
+            videos = conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+        return jsonify({
+            "status": "ok",
+            "version": APP_VERSION,
+            "channels": channels,
+            "tracked_videos": videos,
+            "paused": is_paused(),
+        })
     except Exception as e:
         return jsonify({"status": "error", "error": str(e)}), 500
 
@@ -310,14 +373,17 @@ def health():
 def api_videos():
     with db() as conn:
         rows = conn.execute(
-            "SELECT channel_name, video_id, title, upload_date, filepath, downloaded_at FROM videos ORDER BY upload_date DESC, downloaded_at DESC"
+            "SELECT channel_name, video_id, title, upload_date, filepath, downloaded_at, protected FROM videos ORDER BY upload_date DESC, downloaded_at DESC"
         ).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
 if __name__ == "__main__":
     init_db()
+    seed_settings()
+    apply_log_level()
     # Run one synchronization immediately, then continue in the background.
+    # (While paused — the first-run default — this is a no-op.)
     sync_all()
     threading.Thread(target=worker, daemon=True, name="sync-worker").start()
     # Fixed port: remap via Docker (ports: "8090:8080"), not via env.
