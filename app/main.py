@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 import os
@@ -31,12 +32,19 @@ app = Flask(__name__)
 lock = threading.Lock()
 
 
+@contextlib.contextmanager
 def db():
+    # The sqlite3 connection context manager commits/rolls back but does not
+    # close; wrap it so the connection is always closed on exit.
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=10000")
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -92,7 +100,7 @@ def safe_filename(value, max_len=180):
 
 def output_template():
     # yt-dlp performs the final extension substitution after merging/remuxing.
-    return str(VIDEO_DIR / "%(uploader)s-%(title)s-%(upload_date)s.%(ext)s")
+    return str(VIDEO_DIR / "%(uploader)s-%(upload_date)s-%(title)s.%(ext)s")
 
 
 def ydl_opts(download=False, outtmpl=None):
@@ -170,17 +178,6 @@ def existing(channel_url, video_id):
     return row
 
 
-def find_downloaded_path(channel_url, video_id):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT filepath FROM videos WHERE channel_url=? AND video_id=?",
-            (channel_url, video_id),
-        ).fetchone()
-    if row and Path(row["filepath"]).exists():
-        return Path(row["filepath"])
-    return None
-
-
 def record_video(channel_url, info, filepath):
     now = datetime.now(TZ).isoformat()
     upload_date = info.get("upload_date") or ""
@@ -195,11 +192,6 @@ def record_video(channel_url, info, filepath):
         )
 
 
-def locate_downloaded_file(video_id):
-    matches = list(VIDEO_DIR.glob(f"*{video_id}*.mp4"))
-    return matches[0] if matches else None
-
-
 def download_video(channel_url, video_id):
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     info = get_full_info(video_url)
@@ -209,16 +201,15 @@ def download_video(channel_url, video_id):
     uploader = safe_filename(info.get("channel") or info.get("uploader") or "UnknownChannel")
     title = safe_filename(info.get("title") or video_id)
     upload_date = info.get("upload_date") or "unknown-date"
-    # Include the ID in a temporary/output filename to prevent collisions. It is
-    # removed from the final user-facing filename below.
-    final_name = f"{uploader}-{upload_date}-{title}.mp4"
+    # The video ID is part of the final name so two videos can never collide.
+    final_name = f"{uploader}-{upload_date}-{title}-{video_id}.mp4"
     final_path = VIDEO_DIR / final_name
 
     if final_path.exists():
         record_video(channel_url, info, final_path)
         return final_path
 
-    tmp_template = str(VIDEO_DIR / f".{safe_filename(uploader)}-{safe_filename(title)}-{upload_date}-{video_id}.%(ext)s")
+    tmp_template = str(VIDEO_DIR / f".{uploader}-{upload_date}-{title}-{video_id}.%(ext)s")
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
     opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
@@ -329,4 +320,5 @@ if __name__ == "__main__":
     # Run one synchronization immediately, then continue in the background.
     sync_all()
     threading.Thread(target=worker, daemon=True, name="sync-worker").start()
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    # Fixed port: remap via Docker (ports: "8090:8080"), not via env.
+    app.run(host="0.0.0.0", port=8080)

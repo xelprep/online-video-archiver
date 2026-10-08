@@ -1,4 +1,4 @@
-# Onine Video Archiver
+# Online Video Archiver
 
 A small Docker service that keeps the newest N videos from each configured channel on a mounted volume.
 
@@ -8,7 +8,8 @@ A small Docker service that keeps the newest N videos from each configured chann
 - Polls each channel periodically for new uploads.
 - Deletes older downloads so each channel retains only its newest N.
 - SQLite state database prevents duplicate downloads.
-- Saves videos as `ChannelName-PostDate-VideoTitle.mp4`.
+- Saves videos as `ChannelName-PostDate-VideoTitle-VideoID.mp4` (the ID suffix makes
+  filename collisions impossible).
 - Limits source video to 1080p maximum and prefers H.264/AVC `avc1`, then H.265/HEVC `hvc1`.
 - Uses AAC/M4A audio.
 - Uses FFmpeg only for container mux/remux; it does **not** transcode/re-encode.
@@ -71,6 +72,15 @@ channels:
 
 ## Notes
 
-- YouTube may change or restrict available formats. yt-dlp is installed from its current PyPI-compatible release range when the image is built.
+- The HTTP server binds to `0.0.0.0` inside the container, so it is reachable from your
+  LAN through the published port. To serve on a different host port, change the left side
+  of the mapping in `docker-compose.yml` (e.g. `"8090:8080"`); the container port is fixed
+  at 8080.
+- The container runs as an unprivileged user (UID 1000). On Linux hosts, make sure
+  `./data` is writable by that UID (e.g. `chown -R 1000:1000 data`).
+- YouTube may change or restrict available formats. yt-dlp is pinned to a specific
+  release in `requirements.txt`; bump the pin periodically.
 - Some videos can be age-restricted, members-only, region-restricted, or otherwise unavailable without browser cookies. This base version intentionally does not embed account cookies.
-- The filename is sanitized for common filesystem-invalid characters. If two videos sanitize to the same filename, the service's current implementation can encounter a collision; the SQLite ID remains the authoritative identity.
+- The filename is sanitized for common filesystem-invalid characters, and the YouTube
+  video ID is appended, so sanitized-name collisions cannot cause overwrites. The SQLite
+  row remains the authoritative identity.
