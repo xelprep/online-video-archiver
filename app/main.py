@@ -298,19 +298,41 @@ def ydl_opts(download=False, outtmpl=None):
     return opts
 
 
+# yt-dlp availability values for videos that require authentication (channel
+# membership or YouTube Premium). They appear in a channel's listing but
+# cannot be downloaded without cookies, so they must not consume slots in
+# the channel's latest-N count.
+RESTRICTED_AVAILABILITY = {"subscriber_only", "premium_only"}
+
+
 def list_channel(channel_url, n):
     # Target the channel's uploads tab (…/videos). Extracting the bare channel
     # URL returns the channel's *tabs* (Videos / Shorts / Live / …) as entries —
     # each carrying the channel ID, not a video ID — so downloads would fail
     # with "This video is unavailable". The uploads tab yields the real videos.
     uploads_url = channel_url.rstrip("/") + "/videos"
+    # Members-only / premium-only videos show up in the listing (yt-dlp tags
+    # them with an availability badge) but cannot be downloaded without
+    # auth. They must not consume slots in the latest-N count, so over-fetch —
+    # doubling until enough downloadable entries are found or the listing is
+    # exhausted — then drop them before truncating to N.
     opts = ydl_opts(download=False)
-    opts.update({"playlistend": n, "extract_flat": True})
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(uploads_url, download=False)
-    entries = [] if not info else [e for e in (info.get("entries") or []) if e]
+    opts["extract_flat"] = True
+    cap = max(n * 4, 100)
+    while True:
+        opts["playlistend"] = cap
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(uploads_url, download=False)
+        entries = [] if not info else [e for e in (info.get("entries") or []) if e]
+        downloadable = [
+            e for e in entries
+            if e.get("availability") not in RESTRICTED_AVAILABILITY
+        ]
+        if len(downloadable) >= n or len(entries) <= cap or cap >= 5000:
+            break
+        cap = min(cap * 2, 5000)
     result = []
-    for e in entries[:n]:
+    for e in downloadable[:n]:
         video_id = e.get("id")
         if not video_id:
             continue
@@ -414,6 +436,15 @@ def enforce_retention(channel_url, latest_n):
         log.info("Retention: deleted %s", path)
 
 
+def is_restricted_error(exc):
+    # Auth-gated videos (members-only / premium-only) fail with a
+    # server-provided message ("Join this channel to get access to
+    # members-only content…"). Match on its stable keywords so such videos
+    # can be skipped with a clean warning instead of a full traceback.
+    msg = str(exc).lower()
+    return "members-only" in msg or "join this channel" in msg or "premium" in msg
+
+
 def sync_channel(channel_url, latest_n):
     log.info("Checking %s (latest_n=%d)", channel_url, latest_n)
     entries = list_channel(channel_url, latest_n)
@@ -433,8 +464,16 @@ def sync_channel(channel_url, latest_n):
         try:
             path = download_video(channel_url, entry["id"])
             log.info("Downloaded: %s", path.name)
-        except Exception:
-            log.exception("Failed downloading %s (%s)", entry["id"], entry["title"])
+        except Exception as exc:
+            if is_restricted_error(exc):
+                # Auth-gated video: expected and permanent, so skip it with a
+                # clean warning instead of a full traceback.
+                log.warning(
+                    "Skipping %s (%s): not publicly available (members-only or premium-only)",
+                    entry["id"], entry["title"],
+                )
+            else:
+                log.exception("Failed downloading %s (%s)", entry["id"], entry["title"])
     enforce_retention(channel_url, latest_n)
 
 
