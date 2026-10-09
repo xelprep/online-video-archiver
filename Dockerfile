@@ -3,9 +3,14 @@ FROM python:3.13-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
+# ffmpeg muxes/remuxes downloads. deno is the JavaScript runtime yt-dlp needs
+# to decrypt YouTube signatures; the distro's node is older than yt-dlp's
+# minimum (v22), so we install deno instead. Deno is yt-dlp's default runtime,
+# so no extra option is required in the code. (unzip is needed by the installer.)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
 WORKDIR /app
 COPY requirements.txt .

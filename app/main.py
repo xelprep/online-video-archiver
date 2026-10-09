@@ -277,6 +277,11 @@ def ydl_opts(download=False, outtmpl=None):
         "format": fmt,
         "merge_output_format": "mp4",
         "outtmpl": outtmpl or output_template(),
+        # check_formats probes each format by writing a temp file to the "temp"
+        # output path, which defaults to the cwd. The container runs
+        # unprivileged with cwd=/app (read-only), so pin temp files to a
+        # writable dir under DATA_DIR.
+        "paths": {"temp": str(DATA_DIR / "tmp")},
         "restrictfilenames": False,
         "windowsfilenames": True,
         "overwrites": False,
@@ -294,11 +299,15 @@ def ydl_opts(download=False, outtmpl=None):
 
 
 def list_channel(channel_url, n):
-    # Use the channel's uploads playlist and only inspect enough recent entries.
+    # Target the channel's uploads tab (…/videos). Extracting the bare channel
+    # URL returns the channel's *tabs* (Videos / Shorts / Live / …) as entries —
+    # each carrying the channel ID, not a video ID — so downloads would fail
+    # with "This video is unavailable". The uploads tab yields the real videos.
+    uploads_url = channel_url.rstrip("/") + "/videos"
     opts = ydl_opts(download=False)
     opts.update({"playlistend": n, "extract_flat": True})
     with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(channel_url, download=False)
+        info = ydl.extract_info(uploads_url, download=False)
     entries = [] if not info else [e for e in (info.get("entries") or []) if e]
     result = []
     for e in entries[:n]:
