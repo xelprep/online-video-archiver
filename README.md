@@ -4,6 +4,8 @@ A small Docker service that keeps the newest N videos from each configured chann
 
 ## Features
 
+- Password-locked web UI for managing channels and settings (password via the
+  `WEB_PASSWORD` env var; the app refuses to start without it).
 - Starts **paused** on first run; nothing downloads until you unpause it.
 - Downloads the newest N videos per channel, where N is set per channel.
 - Polls each channel periodically for new uploads (channels with N=0 are skipped).
@@ -14,31 +16,31 @@ A small Docker service that keeps the newest N videos from each configured chann
 - Limits source video to 1080p maximum and prefers H.264/AVC `avc1`, then H.265/HEVC `hvc1`.
 - Uses AAC/M4A audio.
 - Uses FFmpeg only for container mux/remux; it does **not** transcode/re-encode.
-- Exposes a small health/status HTTP API on port 8080.
+- Exposes a public `/health` endpoint on port 8080; everything else is behind the login.
 
 ## Quick start
 
-1. Start:
+1. Set the web UI password in `docker-compose.yml` (`WEB_PASSWORD: "change-me"`).
+
+2. Start:
 
 ```bash
 docker compose up -d --build
 ```
 
-2. Add a channel and unpause the archiver (see [Channels & settings](#channels--settings)).
+3. Open `http://localhost:8080`, sign in, add a channel, and flip the switch to
+   start the archiver (see [Channels & settings](#channels--settings)).
 
 Videos appear under `./data/videos/`; the SQLite database is `./data/archive.db`.
 
-Health check:
+Health check (public, used by the Docker healthcheck):
 
 ```bash
 curl http://localhost:8080/health
 ```
 
-List tracked videos:
-
-```bash
-curl http://localhost:8080/api/videos
-```
+All other endpoints are behind the login; the web UI is the normal way to
+interact with the service.
 
 Follow logs:
 
@@ -54,13 +56,25 @@ The service does not attempt to convert an incompatible video. If a video has no
 
 ## Channels & settings
 
-Channels and runtime settings live in the SQLite database (`./data/archive.db`),
-not in a YAML file. The database starts with **no channels**, and the archiver
-starts **paused**, so nothing downloads until you add a channel and unpause it.
+Everything is managed from the web UI at `http://localhost:8080` (sign in with
+the `WEB_PASSWORD` you set in `docker-compose.yml`):
 
-A web UI for managing channels and settings is on the roadmap. Until it lands,
-manage state with any SQLite tool against `./data/archive.db` (the `./data`
-directory is a host mount):
+- **Status** — a switch that pauses/resumes all archiving (persisted; the app
+  starts paused on first run).
+- **Settings** — poll interval and log level (persisted in the database).
+- **Channels** — add, edit, and remove channels. Each channel requires an
+  explicit "keep latest N" (0 = keep only protected videos). Accepted URL
+  formats: `@handle`, `https://www.youtube.com/@handle`,
+  `https://www.youtube.com/channel/UC...`.
+
+Removing a channel deletes it from the database and moves its downloaded files
+into `./data/videos/orphaned/` (renamed with an `-orphaned-<timestamp>` suffix).
+They are no longer referenced by the app or the UI — delete them from disk when
+you no longer need them.
+
+Channels and settings live in the SQLite database (`./data/archive.db`), so they
+survive restarts. If you ever need to, you can also edit the database directly
+with any SQLite tool (the `./data` directory is a host mount):
 
 ```sql
 -- Add a channel: url + how many recent videos to keep (N)
@@ -70,9 +84,6 @@ VALUES ('https://www.youtube.com/@yourchannel', 10, datetime('now'));
 -- Unpause the archiver (takes effect within ~30 s, no restart needed)
 UPDATE settings SET value = '0' WHERE key = 'paused';
 ```
-
-Accepted channel URL formats: `@handle`, `https://www.youtube.com/@handle`,
-`https://www.youtube.com/channel/UC...`.
 
 ### Per-channel retention
 

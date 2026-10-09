@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Online Video Archiver</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0f1115; color: #e6e6e6;
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between;
+           padding: 1rem 1.5rem; border-bottom: 1px solid #232833; }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  .version { color: #555c6b; font-size: 0.8rem; font-weight: 400; }
+  main { max-width: 960px; margin: 0 auto; padding: 1.5rem; display: grid; gap: 1.25rem; }
+  .card { background: #181c23; border: 1px solid #2a2f3a; border-radius: 12px; padding: 1.25rem 1.5rem; }
+  h2 { font-size: 1rem; margin: 0 0 1rem; }
+  .sub { color: #8b93a3; margin: 0; }
+  .dim { color: #8b93a3; }
+  .hint { color: #8b93a3; font-size: 0.8rem; margin: 0.4rem 0 0; }
+  .hint.ok { color: #7ee787; }
+  .hint.err { color: #ff7b72; }
+  .hint code { background: #0f1115; padding: 0.1rem 0.35rem; border-radius: 4px; }
+  label { display: block; font-size: 0.85rem; color: #8b93a3; margin-bottom: 0.3rem; }
+  input, select { width: 100%; padding: 0.5rem 0.6rem; border-radius: 8px; border: 1px solid #2a2f3a;
+                  background: #0f1115; color: inherit; font: inherit; }
+  input[type=checkbox] { width: auto; }
+  button { padding: 0.5rem 0.9rem; border: 0; border-radius: 8px; background: #4f8cff; color: #fff;
+           font: inherit; font-weight: 600; cursor: pointer; }
+  button:hover { background: #3d7bf0; }
+  button.ghost { background: transparent; border: 1px solid #2a2f3a; color: #cdd3de; font-weight: 400; }
+  button.ghost:hover { background: #232833; }
+  button.danger { color: #ff7b72; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 1rem; align-items: end; }
+  .grid .grow { grid-column: 1 / -1; }
+  .form-actions { display: flex; gap: 0.5rem; align-items: center; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-top: 1px solid #232833; font-size: 0.9rem; }
+  th { color: #8b93a3; font-weight: 500; font-size: 0.8rem; }
+  a { color: #79b8ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .row-actions { white-space: nowrap; }
+  .row-actions button { margin-left: 0.4rem; padding: 0.25rem 0.6rem; font-size: 0.8rem; }
+  .status-row { display: flex; align-items: center; gap: 1rem; }
+  .status-row h2 { margin: 0; }
+  .pill { padding: 0.15rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
+  .pill.running { background: #1d3a24; color: #7ee787; }
+  .pill.paused { background: #3a2d1d; color: #e3b341; }
+  .switch { position: relative; width: 46px; height: 26px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #2a2f3a; border-radius: 999px; cursor: pointer; transition: 0.15s; }
+  .slider::before { content: ""; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px;
+                    background: #8b93a3; border-radius: 50%; transition: 0.15s; }
+  .switch input:checked + .slider { background: #2f6feb; }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Online Video Archiver <span class="version">v{{ version }}</span></h1>
+  <button id="logout" class="ghost">Sign out</button>
+</header>
+
+<main>
+  <section class="card">
+    <div class="status-row">
+      <div>
+        <h2>Status</h2>
+        <p class="sub" id="status-text">Loading…</p>
+      </div>
+      <label class="switch" title="Start / pause the archiver">
+        <input type="checkbox" id="paused-toggle">
+        <span class="slider"></span>
+      </label>
+      <span id="paused-label" class="pill paused">…</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Settings</h2>
+    <form id="settings-form" class="grid">
+      <div>
+        <label for="poll_minutes">Poll interval (minutes)</label>
+        <input type="number" id="poll_minutes" name="poll_minutes" min="1" max="1440" required>
+      </div>
+      <div>
+        <label for="log_level">Log level</label>
+        <select id="log_level" name="log_level">
+          <option>DEBUG</option><option>INFO</option><option>WARNING</option>
+          <option>ERROR</option><option>CRITICAL</option>
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="submit">Save settings</button>
+      </div>
+    </form>
+    <p class="hint" id="settings-msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>Channels</h2>
+    <form id="add-channel" class="grid">
+      <div class="grow">
+        <label for="ch-url">Channel URL</label>
+        <input type="text" id="ch-url" placeholder="@handle or https://www.youtube.com/channel/UC…" required>
+        <p class="hint">Accepted: <code>@handle</code>, <code>https://www.youtube.com/@handle</code>,
+        <code>https://www.youtube.com/channel/UC…</code></p>
+      </div>
+      <div>
+        <label for="ch-n">Keep latest N</label>
+        <input type="number" id="ch-n" min="0" step="1" required>
+        <p class="hint">0 = keep only protected videos</p>
+      </div>
+      <div>
+        <label for="ch-name">Name (optional)</label>
+        <input type="text" id="ch-name">
+      </div>
+      <div class="form-actions">
+        <button type="submit">Add channel</button>
+      </div>
+    </form>
+    <p class="hint" id="channel-msg"></p>
+    <table>
+      <thead><tr><th>Channel</th><th>URL</th><th>Videos</th><th>Keep latest</th><th>Added</th><th></th></tr></thead>
+      <tbody id="channels-body"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const CSRF = "{{ csrf_token }}";
+const $ = (s) => document.querySelector(s);
+
+function esc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json", "X-CSRF-Token": CSRF },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = data.error;
+    throw new Error(typeof err === "string" ? err : (err ? Object.values(err).join("; ") : res.statusText));
+  }
+  return data;
+}
+
+function flash(id, text, ok = true) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  el.className = "hint " + (ok ? "ok" : "err");
+}
+
+function renderStatus(s) {
+  $("#status-text").textContent = s.paused
+    ? "Paused — no downloads will run until you flip the switch."
+    : "Running — checking channels every " + s.poll_minutes + " min.";
+  const label = $("#paused-label");
+  label.textContent = s.paused ? "Paused" : "Running";
+  label.className = "pill " + (s.paused ? "paused" : "running");
+}
+
+async function loadSettings() {
+  const s = await api("GET", "/api/settings");
+  $("#paused-toggle").checked = !s.paused;
+  renderStatus(s);
+  $("#poll_minutes").value = s.poll_minutes;
+  $("#log_level").value = s.log_level;
+}
+
+async function loadChannels() {
+  const channels = await api("GET", "/api/channels");
+  const tbody = $("#channels-body");
+  tbody.innerHTML = "";
+  for (const ch of channels) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="name-cell">' + (esc(ch.name) || '<span class="dim">unnamed</span>') + "</td>" +
+      '<td><a href="' + esc(ch.url) + '" target="_blank" rel="noopener">' + esc(ch.url) + "</a></td>" +
+      '<td class="dim">' + ch.video_count + "</td>" +
+      '<td class="n-cell">' + ch.latest_n + "</td>" +
+      '<td class="dim">' + esc((ch.added_at || "").slice(0, 10)) + "</td>" +
+      '<td class="row-actions"><button class="ghost edit">Edit</button>' +
+      '<button class="ghost danger delete">Delete</button></td>';
+    tr.querySelector(".edit").onclick = () => startEdit(tr, ch);
+    tr.querySelector(".delete").onclick = () => removeChannel(ch);
+    tbody.appendChild(tr);
+  }
+  if (!channels.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="dim">No channels yet — add one above.</td></tr>';
+  }
+}
+
+function startEdit(tr, ch) {
+  if (tr.classList.contains("editing")) return;
+  tr.classList.add("editing");
+  tr.querySelector(".name-cell").innerHTML =
+    '<input type="text" class="edit-name" value="' + esc(ch.name || "") + '">';
+  tr.querySelector(".n-cell").innerHTML =
+    '<input type="number" class="edit-n" min="0" step="1" value="' + ch.latest_n + '">';
+  const actions = tr.querySelector(".row-actions");
+  actions.innerHTML = '<button class="ghost save">Save</button><button class="ghost cancel">Cancel</button>';
+  actions.querySelector(".save").onclick = async () => {
+    try {
+      await api("PUT", "/api/channels", {
+        url: ch.url,
+        name: tr.querySelector(".edit-name").value,
+        latest_n: parseInt(tr.querySelector(".edit-n").value, 10),
+      });
+      flash("channel-msg", "Channel updated.");
+      loadChannels();
+    } catch (e) { flash("channel-msg", e.message, false); }
+  };
+  actions.querySelector(".cancel").onclick = () => loadChannels();
+}
+
+async function removeChannel(ch) {
+  const msg = "Remove " + (ch.name || ch.url) + "?\n" +
+    "Its " + ch.video_count + " downloaded video(s) will be moved to the orphaned folder " +
+    "(kept on disk, no longer managed by the app).";
+  if (!confirm(msg)) return;
+  try {
+    await api("DELETE", "/api/channels", { url: ch.url });
+    flash("channel-msg", "Channel removed.");
+    loadChannels();
+  } catch (e) { flash("channel-msg", e.message, false); }
+}
+
+$("#paused-toggle").onchange = async (e) => {
+  try {
+    const s = await api("PUT", "/api/settings", { paused: !e.target.checked });
+    renderStatus(s);
+  } catch (err) {
+    e.target.checked = !e.target.checked;
+    flash("settings-msg", err.message, false);
+  }
+};
+
+$("#settings-form").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    const s = await api("PUT", "/api/settings", {
+      poll_minutes: parseInt($("#poll_minutes").value, 10),
+      log_level: $("#log_level").value,
+    });
+    flash("settings-msg", "Settings saved.");
+    renderStatus(s);
+  } catch (err) { flash("settings-msg", err.message, false); }
+};
+
+$("#add-channel").onsubmit = async (e) => {
+  e.preventDefault();
+  try {
+    await api("POST", "/api/channels", {
+      url: $("#ch-url").value,
+      latest_n: parseInt($("#ch-n").value, 10),
+      name: $("#ch-name").value,
+    });
+    flash("channel-msg", "Channel added.");
+    e.target.reset();
+    loadChannels();
+  } catch (err) { flash("channel-msg", err.message, false); }
+};
+
+$("#logout").onclick = async () => {
+  await fetch("/logout", { method: "POST" });
+  location.href = "/login";
+};
+
+(async () => {
+  try {
+    await loadSettings();
+    await loadChannels();
+  } catch (e) {
+    document.body.innerHTML = "<p style='padding:2rem'>" + esc(e.message) + "</p>";
+  }
+})();
+</script>
+</body>
+</html>
