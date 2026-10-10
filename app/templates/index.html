@@ -59,6 +59,12 @@
                     background: #8b93a3; border-radius: 50%; transition: 0.15s; }
   .switch input:checked + .slider { background: #2f6feb; }
   .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
+  .subhead { font-size: 0.9rem; margin: 1.5rem 0 0.25rem; color: #cdd3de; }
+  .settings-actions { display: flex; gap: 0.5rem; align-items: center; margin-top: 1rem; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: #cdd3de; }
+  .filter-row th { border-top: 0; padding-top: 0; }
+  .filter-row input, .filter-row select { width: 100%; padding: 0.25rem 0.4rem; font-size: 0.8rem; }
 </style>
 </head>
 <body>
@@ -95,20 +101,63 @@
 
   <section class="card">
     <h2>Settings</h2>
-    <form id="settings-form" class="grid">
-      <div>
-        <label for="poll_minutes">Poll interval (minutes)</label>
-        <input type="number" id="poll_minutes" name="poll_minutes" min="1" max="1440" required>
+    <form id="settings-form">
+      <div class="grid">
+        <div>
+          <label for="poll_minutes">Poll interval (minutes)</label>
+          <input type="number" id="poll_minutes" name="poll_minutes" min="1" max="1440" required>
+        </div>
+        <div>
+          <label for="log_level">Log level</label>
+          <select id="log_level" name="log_level">
+            <option>DEBUG</option><option>INFO</option><option>WARNING</option>
+            <option>ERROR</option><option>CRITICAL</option>
+          </select>
+        </div>
       </div>
-      <div>
-        <label for="log_level">Log level</label>
-        <select id="log_level" name="log_level">
-          <option>DEBUG</option><option>INFO</option><option>WARNING</option>
-          <option>ERROR</option><option>CRITICAL</option>
-        </select>
+
+      <h3 class="subhead">Error email (SMTP)</h3>
+      <p class="hint">When the archiver hits an error it can email you, so failures are visible
+      even when running unattended. For <b>Gmail</b>: create an <b>App Password</b>
+      (Google Account → Security → 2-Step Verification → App passwords), then use host
+      <code>smtp.gmail.com</code>, port <code>587</code>, encryption <b>STARTTLS</b>.</p>
+      <div class="grid">
+        <div>
+          <label for="smtp_host">SMTP host</label>
+          <input type="text" id="smtp_host" placeholder="smtp.gmail.com">
+        </div>
+        <div>
+          <label for="smtp_port">Port</label>
+          <input type="number" id="smtp_port" min="1" max="65535" placeholder="587">
+        </div>
+        <div>
+          <label for="smtp_encryption">Encryption</label>
+          <select id="smtp_encryption">
+            <option value="starttls">STARTTLS (587)</option>
+            <option value="ssl">SSL/TLS (465)</option>
+            <option value="none">None</option>
+          </select>
+        </div>
+        <div>
+          <label for="smtp_username">Username</label>
+          <input type="text" id="smtp_username" placeholder="you@gmail.com" autocomplete="off">
+        </div>
+        <div>
+          <label for="smtp_password">Password / app password</label>
+          <input type="password" id="smtp_password" placeholder="Gmail app password" autocomplete="off">
+        </div>
+        <div>
+          <label for="smtp_from">From address</label>
+          <input type="text" id="smtp_from" placeholder="defaults to username">
+        </div>
+        <div>
+          <label for="smtp_to">To address</label>
+          <input type="text" id="smtp_to" placeholder="where errors are sent">
+        </div>
       </div>
-      <div class="form-actions">
+      <div class="settings-actions">
         <button type="submit">Save settings</button>
+        <button type="button" id="test-email-btn" class="ghost">Send test email</button>
       </div>
     </form>
     <p class="hint" id="settings-msg"></p>
@@ -161,8 +210,29 @@
       <video id="player" controls></video>
       <p class="dim" id="player-title"></p>
     </div>
-    <table>
-      <thead><tr><th>Channel</th><th>Title</th><th>Uploaded</th><th>Protected</th><th></th></tr></thead>
+    <table id="videos-table">
+      <thead>
+        <tr>
+          <th data-key="channel_name" data-label="Channel" class="sortable" title="Click to sort">Channel</th>
+          <th data-key="title" data-label="Title" class="sortable" title="Click to sort">Title</th>
+          <th data-key="upload_date" data-label="Uploaded" class="sortable" title="Click to sort">Uploaded</th>
+          <th data-key="protected" data-label="Protected" class="sortable" title="Click to sort">Protected</th>
+          <th></th>
+        </tr>
+        <tr class="filter-row">
+          <th><input type="text" data-filter="channel_name" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="title" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="upload_date" placeholder="Filter…"></th>
+          <th>
+            <select data-filter="protected">
+              <option value="">All</option>
+              <option value="1">Protected</option>
+              <option value="0">Unprotected</option>
+            </select>
+          </th>
+          <th></th>
+        </tr>
+      </thead>
       <tbody id="videos-body"></tbody>
     </table>
   </section>
@@ -234,6 +304,13 @@ async function loadSettings() {
   renderStatus(s);
   $("#poll_minutes").value = s.poll_minutes;
   $("#log_level").value = s.log_level;
+  $("#smtp_host").value = s.smtp_host || "";
+  $("#smtp_port").value = s.smtp_port || "";
+  $("#smtp_encryption").value = s.smtp_encryption || "starttls";
+  $("#smtp_username").value = s.smtp_username || "";
+  $("#smtp_password").value = s.smtp_password || "";
+  $("#smtp_from").value = s.smtp_from || "";
+  $("#smtp_to").value = s.smtp_to || "";
 }
 
 async function loadChannels() {
@@ -337,16 +414,42 @@ async function pollRefresh() {
 
 $("#refresh-btn").onclick = doRefresh;
 
+async function saveSettings() {
+  return api("PUT", "/api/settings", {
+    poll_minutes: parseInt($("#poll_minutes").value, 10),
+    log_level: $("#log_level").value,
+    smtp_host: $("#smtp_host").value,
+    smtp_port: parseInt($("#smtp_port").value, 10),
+    smtp_encryption: $("#smtp_encryption").value,
+    smtp_username: $("#smtp_username").value,
+    smtp_password: $("#smtp_password").value,
+    smtp_from: $("#smtp_from").value,
+    smtp_to: $("#smtp_to").value,
+  });
+}
+
 $("#settings-form").onsubmit = async (e) => {
   e.preventDefault();
   try {
-    const s = await api("PUT", "/api/settings", {
-      poll_minutes: parseInt($("#poll_minutes").value, 10),
-      log_level: $("#log_level").value,
-    });
+    const s = await saveSettings();
     flash("settings-msg", "Settings saved.");
     renderStatus(s);
   } catch (err) { flash("settings-msg", err.message, false); }
+};
+
+$("#test-email-btn").onclick = async () => {
+  const btn = $("#test-email-btn");
+  btn.disabled = true;
+  flash("settings-msg", "Saving and sending test email…");
+  try {
+    await saveSettings();
+    const r = await api("POST", "/api/settings/test-email", {});
+    flash("settings-msg", r.message, true);
+  } catch (err) {
+    flash("settings-msg", err.message, false);
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 $("#add-channel").onsubmit = async (e) => {
@@ -368,11 +471,48 @@ $("#logout").onclick = async () => {
   location.href = "/login";
 };
 
+let allVideos = [];
+let videoSort = { key: "upload_date", dir: "desc" };
+let videoFilters = { channel_name: "", title: "", upload_date: "", protected: "" };
+
 async function loadVideos() {
-  const videos = await api("GET", "/api/videos");
+  allVideos = await api("GET", "/api/videos");
+  renderVideos();
+}
+
+function renderVideos() {
   const tbody = $("#videos-body");
+  let rows = allVideos.slice();
+
+  // Apply the per-column filters.
+  for (const [key, val] of Object.entries(videoFilters)) {
+    if (val === "" || val === undefined) continue;
+    if (key === "protected") {
+      rows = rows.filter((v) => (v.protected ? "1" : "0") === val);
+    } else {
+      const needle = val.toLowerCase();
+      rows = rows.filter((v) => String(v[key] ?? "").toLowerCase().includes(needle));
+    }
+  }
+
+  // Sort by the selected column (click a header to toggle direction).
+  const { key, dir } = videoSort;
+  const mul = dir === "asc" ? 1 : -1;
+  rows.sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (key === "protected") { av = av ? 1 : 0; bv = bv ? 1 : 0; }
+    if (av == null) av = "";
+    if (bv == null) bv = "";
+    if (typeof av === "string" && typeof bv === "string") {
+      return av.localeCompare(bv) * mul;
+    }
+    if (av < bv) return -1 * mul;
+    if (av > bv) return 1 * mul;
+    return 0;
+  });
+
   tbody.innerHTML = "";
-  for (const v of videos) {
+  for (const v of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td class="dim">' + esc(v.channel_name) + "</td>" +
@@ -386,19 +526,51 @@ async function loadVideos() {
     tr.querySelector(".protect").onchange = async (e) => {
       try {
         await api("PATCH", "/api/videos", { id: v.id, protected: e.target.checked });
+        v.protected = e.target.checked ? 1 : 0;
         flash("video-msg", e.target.checked ? "Video protected." : "Protection removed.");
       } catch (err) {
         e.target.checked = !e.target.checked;
+        v.protected = e.target.checked ? 1 : 0;
         flash("video-msg", err.message, false);
       }
     };
     tr.querySelector(".play").onclick = () => playVideo(v);
     tbody.appendChild(tr);
   }
-  if (!videos.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="dim">No videos yet.</td></tr>';
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="dim">' +
+      (allVideos.length ? "No videos match the filters." : "No videos yet.") + "</td></tr>";
   }
+  updateSortIndicators();
 }
+
+function updateSortIndicators() {
+  document.querySelectorAll("#videos-table th.sortable").forEach((th) => {
+    th.textContent = th.dataset.label +
+      (th.dataset.key === videoSort.key ? (videoSort.dir === "asc" ? " ▲" : " ▼") : "");
+  });
+}
+
+document.querySelectorAll("#videos-table th.sortable").forEach((th) => {
+  th.onclick = () => {
+    const key = th.dataset.key;
+    if (videoSort.key === key) {
+      videoSort.dir = videoSort.dir === "asc" ? "desc" : "asc";
+    } else {
+      videoSort.key = key;
+      videoSort.dir = "asc";
+    }
+    renderVideos();
+  };
+});
+
+document.querySelectorAll("#videos-table [data-filter]").forEach((el) => {
+  const evt = el.tagName === "SELECT" ? "change" : "input";
+  el.addEventListener(evt, () => {
+    videoFilters[el.dataset.filter] = el.value;
+    renderVideos();
+  });
+});
 
 function playVideo(v) {
   const wrap = $("#player-wrap");

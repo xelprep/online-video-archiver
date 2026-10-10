@@ -6,11 +6,16 @@ import os
 import re
 import secrets
 import shutil
+import smtplib
+import socket
 import sqlite3
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
+from email.utils import make_msgid
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
@@ -164,6 +169,94 @@ def apply_log_level():
         pass
 
 
+# ---------------------------------------------------------------------------
+# Error email (SMTP): report failures to the user by email. The app is meant to
+# run unattended, so a persistent failure should reach the user even when they
+# are not watching the logs. STARTTLS is supported (Gmail, port 587).
+# ---------------------------------------------------------------------------
+
+SMTP_ENCRYPTION = ("starttls", "ssl", "none")
+# A persistent failure (e.g. a channel that keeps erroring) must not email the
+# user every poll cycle. Identical errors are throttled to at most one email
+# per window.
+EMAIL_COOLDOWN_SECONDS = 6 * 3600
+email_cooldown = {}
+email_cooldown_lock = threading.Lock()
+
+
+def send_email(subject, body):
+    # Send a plain-text email via the configured SMTP server. Returns
+    # (ok, message) and never raises — a mail failure must not break the app.
+    host = (get_setting("smtp_host") or "").strip()
+    if not host:
+        return False, "SMTP host is not configured"
+    try:
+        port = int(get_setting("smtp_port", "587") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    encryption = (get_setting("smtp_encryption", "starttls") or "starttls").lower()
+    username = (get_setting("smtp_username") or "").strip()
+    password = get_setting("smtp_password") or ""
+    sender = (get_setting("smtp_from") or "").strip() or username
+    recipient = (get_setting("smtp_to") or "").strip() or username
+    if not recipient:
+        return False, "No recipient — set the To address (or the username)"
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+    msg["Message-ID"] = make_msgid()
+
+    try:
+        if encryption == "ssl":
+            server = smtplib.SMTP_SSL(host, port, timeout=30)
+        else:
+            server = smtplib.SMTP(host, port, timeout=30)
+            if encryption == "starttls":
+                server.starttls()
+        with server:
+            if username:
+                server.login(username, password)
+            server.sendmail(sender, [recipient], msg.as_string())
+        return True, "sent"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def report_error(context, exc, force=False):
+    # Log the error (with traceback) and, if SMTP is configured, email it to the
+    # user. Repeated identical errors are throttled so a persistent failure does
+    # not spam the inbox every poll cycle. `force` bypasses the throttle (used
+    # for user-initiated actions such as an on-demand download).
+    tb = traceback.format_exc()
+    log.error("%s: %s%s", context, exc, ("\n" + tb) if tb else "")
+    if not (get_setting("smtp_host") or "").strip():
+        return
+    key = f"{context}|{exc}"
+    now = time.time()
+    if not force:
+        with email_cooldown_lock:
+            last = email_cooldown.get(key)
+            if last is not None and now - last < EMAIL_COOLDOWN_SECONDS:
+                return
+            email_cooldown[key] = now
+    body = (
+        f"{context}\n\n"
+        f"{exc}\n\n"
+        f"{tb}\n\n"
+        f"---\n"
+        f"Time: {now_iso()}\n"
+        f"Host: {socket.gethostname()}\n"
+        f"Version: {APP_VERSION}\n"
+    )
+    ok, msg = send_email(f"[video-archiver] {context}", body)
+    if ok:
+        log.info("Error email sent for: %s", context)
+    else:
+        log.warning("Failed to send error email for %s: %s", context, msg)
+
+
 def load_channels():
     with db() as conn:
         rows = conn.execute(
@@ -248,10 +341,21 @@ def get_settings():
         poll_minutes = int(get_setting("poll_minutes", str(POLL_MINUTES_DEFAULT)))
     except (TypeError, ValueError):
         poll_minutes = POLL_MINUTES_DEFAULT
+    try:
+        smtp_port = int(get_setting("smtp_port", "587") or 587)
+    except (TypeError, ValueError):
+        smtp_port = 587
     return {
         "poll_minutes": poll_minutes,
         "log_level": get_setting("log_level", "INFO"),
         "paused": is_paused(),
+        "smtp_host": get_setting("smtp_host", ""),
+        "smtp_port": smtp_port,
+        "smtp_encryption": get_setting("smtp_encryption", "starttls"),
+        "smtp_username": get_setting("smtp_username", ""),
+        "smtp_password": get_setting("smtp_password", ""),
+        "smtp_from": get_setting("smtp_from", ""),
+        "smtp_to": get_setting("smtp_to", ""),
     }
 
 
@@ -558,7 +662,7 @@ def sync_channel(channel_url, latest_n):
                     entry["id"], entry["title"],
                 )
             else:
-                log.exception("Failed downloading %s (%s)", entry["id"], entry["title"])
+                report_error(f"Failed downloading {entry['id']} ({entry['title']})", exc)
     enforce_retention(channel_url, latest_n)
 
 
@@ -570,8 +674,8 @@ def _sync_channels():
             continue
         try:
             sync_channel(ch["url"], ch["latest_n"])
-        except Exception:
-            log.exception("Channel sync failed: %s", ch["url"])
+        except Exception as exc:
+            report_error(f"Channel sync failed: {ch['url']}", exc)
 
 
 def sync_all():
@@ -603,8 +707,8 @@ def worker():
         started = time.monotonic()
         try:
             sync_all()
-        except Exception:
-            log.exception("Sync cycle failed")
+        except Exception as exc:
+            report_error("Sync cycle failed", exc)
         elapsed = time.monotonic() - started
         if paused:
             # Re-check the flag frequently so an unpause takes effect quickly.
@@ -739,7 +843,7 @@ def _run_download_task(task_id, url_or_id):
         download_by_url(url_or_id)
         update(status="done", message="Download complete")
     except Exception as exc:
-        log.exception("On-demand download failed: %s", url_or_id)
+        report_error(f"On-demand download failed: {url_or_id}", exc, force=True)
         update(status="error", error=str(exc), message="Failed: " + str(exc))
 
 
@@ -859,9 +963,54 @@ def api_update_settings():
             apply_log_level()
     if "paused" in data:
         set_setting("paused", "1" if data["paused"] else "0")
+    # SMTP / error-email settings.
+    if "smtp_host" in data:
+        set_setting("smtp_host", str(data["smtp_host"]).strip())
+    if "smtp_port" in data:
+        try:
+            port = int(data["smtp_port"])
+        except (TypeError, ValueError):
+            port = None
+            errors["smtp_port"] = "must be an integer"
+        if port is not None and not 1 <= port <= 65535:
+            port = None
+            errors["smtp_port"] = "must be between 1 and 65535"
+        if port is not None:
+            set_setting("smtp_port", port)
+    if "smtp_encryption" in data:
+        enc = str(data["smtp_encryption"]).lower()
+        if enc not in SMTP_ENCRYPTION:
+            errors["smtp_encryption"] = "must be one of: " + ", ".join(SMTP_ENCRYPTION)
+        else:
+            set_setting("smtp_encryption", enc)
+    if "smtp_username" in data:
+        set_setting("smtp_username", str(data["smtp_username"]).strip())
+    if "smtp_password" in data:
+        set_setting("smtp_password", str(data["smtp_password"]))
+    if "smtp_from" in data:
+        set_setting("smtp_from", str(data["smtp_from"]).strip())
+    if "smtp_to" in data:
+        set_setting("smtp_to", str(data["smtp_to"]).strip())
     if errors:
         return jsonify({"error": errors}), 400
     return jsonify(get_settings())
+
+
+@app.post("/api/settings/test-email")
+@require_auth
+@require_csrf
+def api_test_email():
+    # Send a one-off test message so the user can verify their SMTP settings
+    # before relying on them for error reporting.
+    ok, msg = send_email(
+        "[video-archiver] Test email",
+        "This is a test email from your Online Video Archiver.\n"
+        "If you received this, your SMTP settings are working and error "
+        "reports will be delivered here.",
+    )
+    if ok:
+        return jsonify({"ok": True, "message": "Test email sent — check your inbox."})
+    return jsonify({"ok": False, "message": msg}), 400
 
 
 @app.get("/api/channels")
