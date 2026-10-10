@@ -253,7 +253,9 @@ def safe_filename(value, max_len=180):
 
 def output_template():
     # yt-dlp performs the final extension substitution after merging/remuxing.
-    return str(VIDEO_DIR / "%(uploader)s-%(upload_date)s-%(title)s.%(ext)s")
+    # Files live in a per-channel subfolder; the channel name is not part of
+    # the file name itself.
+    return str(VIDEO_DIR / "%(uploader)s" / "%(upload_date)s-%(title)s.%(ext)s")
 
 
 def ydl_opts(download=False, outtmpl=None):
@@ -385,26 +387,30 @@ def download_video(channel_url, video_id):
     uploader = safe_filename(info.get("channel") or info.get("uploader") or "UnknownChannel")
     title = safe_filename(info.get("title") or video_id)
     upload_date = info.get("upload_date") or "unknown-date"
-    # The video ID is part of the final name so two videos can never collide.
-    final_name = f"{uploader}-{upload_date}-{title}-{video_id}.mp4"
-    final_path = VIDEO_DIR / final_name
+    # Videos live in a per-channel subfolder; the channel name is not part of
+    # the file name itself. The video ID is part of the name so two videos can
+    # never collide.
+    channel_dir = VIDEO_DIR / uploader
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    final_name = f"{upload_date}-{title}-{video_id}.mp4"
+    final_path = channel_dir / final_name
 
     if final_path.exists():
         record_video(channel_url, info, final_path)
         return final_path
 
-    tmp_template = str(VIDEO_DIR / f".{uploader}-{upload_date}-{title}-{video_id}.%(ext)s")
+    tmp_template = str(channel_dir / f".{upload_date}-{title}-{video_id}.%(ext)s")
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
     opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
     with YoutubeDL(opts) as ydl:
         ydl.download([video_url])
 
-    candidates = list(VIDEO_DIR.glob(f".*-{video_id}.mp4"))
+    candidates = list(channel_dir.glob(f".*-{video_id}.mp4"))
     if not candidates:
         # yt-dlp may have changed the exact temporary name; locate a recent mp4
         # matching the video title/date and use it if there is exactly one.
-        candidates = [p for p in VIDEO_DIR.glob("*.mp4") if video_id in p.name]
+        candidates = [p for p in channel_dir.glob("*.mp4") if video_id in p.name]
     if not candidates:
         raise RuntimeError(f"Download completed but output file for {video_id} was not found")
 
