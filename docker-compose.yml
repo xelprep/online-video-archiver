@@ -4,7 +4,8 @@ services:
     container_name: online-video-archiver
     restart: unless-stopped
     environment:
-      # Required: password for the web UI. The app refuses to start without it.
+      # Required: password for the web UI. The app refuses to start if this is
+      # unset or left as a placeholder (e.g. "change-me"). Set a strong value.
       WEB_PASSWORD: "change-me"
       # Initial defaults only; runtime settings live in the SQLite settings table.
       POLL_MINUTES: "30"

@@ -27,6 +27,10 @@ LOG_LEVEL_DEFAULT = os.getenv("LOG_LEVEL", "INFO").upper()
 PAUSE_POLL_SECONDS = 30
 # Web UI password (B3/C7). Required: the app refuses to start without it.
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "")
+# Placeholder/example passwords that must never be used in production. If the
+# configured password is one of these, refuse to start — we don't want an
+# easily-guessed interface left exposed (C7 hardening).
+PLACEHOLDER_PASSWORDS = {"change-me", "changeme", "password", "123456"}
 # Login throttling (in-memory; resets on restart).
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCKOUT_SECONDS = 60
@@ -174,6 +178,21 @@ def now_iso():
     return datetime.now(TZ).isoformat()
 
 
+def dir_size(path):
+    # Total size in bytes of all regular files under `path` (recursive).
+    p = Path(path)
+    if not p.exists():
+        return 0
+    total = 0
+    for f in p.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
 # ---------------------------------------------------------------------------
 # Web UI (Phase 2): auth, CSRF, settings & channels APIs
 # ---------------------------------------------------------------------------
@@ -258,12 +277,30 @@ def parse_latest_n(value):
     return n if n >= 0 else None
 
 
-def safe_filename(value, max_len=180):
+def safe_filename(value, max_bytes=180):
+    # Sanitize a string for use as a single filesystem path component.
+    # Truncation is by UTF-8 *bytes* (not characters) so a non-ASCII title can
+    # never push a component past the 255-byte per-name limit (APFS/ext4).
     value = value.replace("/", "-").replace("\\", "-")
     value = re.sub(r'[<>:"|?*\x00-\x1f]', "_", value)
     value = re.sub(r"\s+", " ", value).strip().rstrip(".")
     value = re.sub(r"[. ]+$", "", value)
-    return value[:max_len] or "untitled"
+    encoded = value.encode("utf-8")
+    if len(encoded) > max_bytes:
+        value = encoded[:max_bytes].decode("utf-8", "ignore").rstrip(". ")
+    return value or "untitled"
+
+
+def title_budget(channel_dir, upload_date, video_id):
+    # How many UTF-8 bytes the title may use so that (a) the filename
+    # {upload_date}-{title}-{video_id}.mp4 stays within the 255-byte per-name
+    # limit and (b) the full path stays within PATH_MAX (4096 bytes).
+    ud = len(upload_date.encode("utf-8"))
+    vid = len(video_id.encode("utf-8"))
+    dirb = len(str(channel_dir).encode("utf-8"))
+    by_name = 255 - ud - vid - 6          # ud + 1 + title + 1 + vid + 4
+    by_path = 4096 - dirb - ud - vid - 7  # dir + 1 + ud + 1 + title + 1 + vid + 4
+    return max(1, min(180, by_name, by_path))
 
 
 def output_template():
@@ -274,15 +311,15 @@ def output_template():
 
 
 def ydl_opts(download=False, outtmpl=None):
-    # Apple-TV-friendly selection: never exceed 1080p and prefer H.264/AVC
-    # over HEVC. The height constraint is applied to the source video stream,
-    # so yt-dlp never downloads 4K/1440p merely to discard or transcode it.
-    # Separate video/audio streams are muxed into MP4 by FFmpeg without re-encoding.
+    # Apple-TV-friendly selection: H.264/AVC (avc1) only, never exceeding 1080p.
+    # HEVC (hvc1) and VP9/AV1 are deliberately excluded — older Apple TV models
+    # do not decode VP9, and the goal is broad compatibility, not max quality.
+    # The height constraint is applied to the source video stream, so yt-dlp
+    # never downloads 4K/1440p merely to discard or transcode it. Separate
+    # video/audio streams are muxed into MP4 by FFmpeg without re-encoding.
     fmt = (
         "(bv*[height<=1080][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a])"
-        "/(bv*[height<=1080][ext=mp4][vcodec^=hvc1]+ba[ext=m4a][acodec^=mp4a])"
         "/(b[height<=1080][ext=mp4][vcodec^=avc1][acodec^=mp4a])"
-        "/(b[height<=1080][ext=mp4][vcodec^=hvc1][acodec^=mp4a])"
     )
     opts = {
         "quiet": not download,
@@ -308,8 +345,12 @@ def ydl_opts(download=False, outtmpl=None):
         "concurrent_fragment_downloads": 4,
         "socket_timeout": 30,
         "check_formats": True,
+        # Remux (never re-encode) into MP4. -movflags +faststart moves the moov
+        # atom to the front of the file so Apple TV can begin playback without
+        # first downloading the whole file. No codec args => streams are copied.
         "postprocessors": [
-            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
+            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4",
+             "additional_args": ["-movflags", "+faststart"]}
         ],
     }
     return opts
@@ -401,13 +442,18 @@ def download_video(channel_url, video_id, info=None):
         raise RuntimeError(f"Could not extract metadata for {video_id}")
 
     uploader = safe_filename(info.get("channel") or info.get("uploader") or "UnknownChannel")
-    title = safe_filename(info.get("title") or video_id)
     upload_date = info.get("upload_date") or "unknown-date"
     # Videos live in a per-channel subfolder; the channel name is not part of
     # the file name itself. The video ID is part of the name so two videos can
     # never collide.
     channel_dir = VIDEO_DIR / uploader
     channel_dir.mkdir(parents=True, exist_ok=True)
+    # Truncate the title to a byte budget so the filename and full path stay
+    # within filesystem limits even for very long / non-ASCII titles.
+    title = safe_filename(
+        info.get("title") or video_id,
+        max_bytes=title_budget(channel_dir, upload_date, video_id),
+    )
     final_name = f"{upload_date}-{title}-{video_id}.mp4"
     final_path = channel_dir / final_name
 
@@ -418,7 +464,6 @@ def download_video(channel_url, video_id, info=None):
     tmp_template = str(channel_dir / f".{upload_date}-{title}-{video_id}.%(ext)s")
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
-    opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
     try:
         with YoutubeDL(opts) as ydl:
             ydl.download([video_url])
@@ -512,6 +557,18 @@ def sync_channel(channel_url, latest_n):
     enforce_retention(channel_url, latest_n)
 
 
+def _sync_channels():
+    # Shared body of a sync cycle: process every channel with N>0.
+    for ch in load_channels():
+        if ch["latest_n"] <= 0:
+            # C8: channels with N=0 are skipped during the scheduled poll.
+            continue
+        try:
+            sync_channel(ch["url"], ch["latest_n"])
+        except Exception:
+            log.exception("Channel sync failed: %s", ch["url"])
+
+
 def sync_all():
     if is_paused():
         log.info("Archiver is paused; skipping sync")
@@ -520,16 +577,18 @@ def sync_all():
         log.info("Sync already running; skipping overlapping cycle")
         return
     try:
-        for ch in load_channels():
-            if ch["latest_n"] <= 0:
-                # C8: channels with N=0 are skipped during the scheduled poll.
-                continue
-            try:
-                sync_channel(ch["url"], ch["latest_n"])
-            except Exception:
-                log.exception("Channel sync failed: %s", ch["url"])
+        _sync_channels()
     finally:
         lock.release()
+
+
+def sync_all_blocking():
+    # Manual "refresh now": wait for the lock (instead of skipping) so the
+    # requested cycle always runs to completion, even if the worker is busy.
+    if is_paused():
+        return
+    with lock:
+        _sync_channels()
 
 
 def worker():
@@ -561,6 +620,37 @@ def worker():
 # fine — a completed download is persisted in the DB and on disk).
 download_tasks = {}
 download_tasks_lock = threading.Lock()
+
+# In-flight state for the manual "refresh now" action (lost on restart, which is
+# fine — it only reflects the in-flight manual sync, not persisted state).
+refresh_state = {"running": False, "last": None, "error": None}
+refresh_state_lock = threading.Lock()
+
+
+def trigger_refresh():
+    # Kick off an immediate sync cycle in the background. Returns False if a
+    # manual refresh is already in flight. sync_all() itself skips (non-blocking
+    # lock) if the scheduled worker is mid-sync, so cycles never overlap.
+    with refresh_state_lock:
+        if refresh_state["running"]:
+            return False
+        refresh_state["running"] = True
+        refresh_state["error"] = None
+
+    def run():
+        try:
+            sync_all_blocking()
+        except Exception as exc:
+            log.exception("Manual refresh failed")
+            with refresh_state_lock:
+                refresh_state["error"] = str(exc)
+        finally:
+            with refresh_state_lock:
+                refresh_state["running"] = False
+                refresh_state["last"] = now_iso()
+
+    threading.Thread(target=run, daemon=True, name="manual-refresh").start()
+    return True
 
 
 def extract_video_id(url_or_id):
@@ -713,6 +803,29 @@ def logout():
 @require_auth
 def api_get_settings():
     return jsonify(get_settings())
+
+
+@app.get("/api/disk")
+@require_auth
+def api_disk():
+    # Disk usage of the data volume, broken out so the UI can show how much
+    # space active videos vs. the orphaned folder consume, plus free space.
+    try:
+        fs = shutil.disk_usage(DATA_DIR)
+        fs_total, fs_used, fs_free = fs.total, fs.used, fs.free
+    except OSError:
+        fs_total = fs_used = fs_free = None
+    videos_total = dir_size(VIDEO_DIR)
+    orphaned = dir_size(VIDEO_DIR / "orphaned")
+    return jsonify({
+        "data_total": dir_size(DATA_DIR),
+        "videos_total": videos_total,
+        "videos_active": max(0, videos_total - orphaned),
+        "orphaned": orphaned,
+        "fs_total": fs_total,
+        "fs_used": fs_used,
+        "fs_free": fs_free,
+    })
 
 
 @app.put("/api/settings")
@@ -937,11 +1050,38 @@ def api_download_status(task_id):
     return jsonify(task)
 
 
+@app.post("/api/refresh")
+@require_auth
+@require_csrf
+def api_refresh():
+    # Manually trigger an immediate sync cycle (the "Refresh now" button).
+    # Respects the pause flag — if paused, nothing downloads.
+    if is_paused():
+        return jsonify({"error": "Archiver is paused — turn on the running switch first."}), 409
+    if not trigger_refresh():
+        return jsonify({"status": "already_running"}), 202
+    return jsonify({"status": "started"}), 202
+
+
+@app.get("/api/refresh")
+@require_auth
+def api_refresh_status():
+    with refresh_state_lock:
+        return jsonify(dict(refresh_state))
+
+
 if __name__ == "__main__":
     if not WEB_PASSWORD:
         log.critical(
             "WEB_PASSWORD is not set. The web UI password is required — set the "
             "WEB_PASSWORD environment variable (e.g. in docker-compose.yml) and restart."
+        )
+        sys.exit(1)
+    if WEB_PASSWORD in PLACEHOLDER_PASSWORDS:
+        log.critical(
+            "WEB_PASSWORD is set to a placeholder value (%r). Choose a strong, "
+            "non-obvious password — the app refuses to start with the example "
+            "password from the docs.", WEB_PASSWORD,
         )
         sys.exit(1)
     init_db()

@@ -79,7 +79,18 @@
         <span class="slider"></span>
       </label>
       <span id="paused-label" class="pill paused">…</span>
+      <button id="refresh-btn" class="ghost" title="Check all channels for new videos right now">Refresh now</button>
     </div>
+    <p class="hint" id="refresh-msg"></p>
+  </section>
+
+  <section class="card">
+    <h2>Storage</h2>
+    <table>
+      <thead><tr><th>Category</th><th>Size</th></tr></thead>
+      <tbody id="disk-body"></tbody>
+    </table>
+    <p class="hint" id="disk-hint"></p>
   </section>
 
   <section class="card">
@@ -186,6 +197,28 @@ function flash(id, text, ok = true) {
   el.className = "hint " + (ok ? "ok" : "err");
 }
 
+function fmtBytes(n) {
+  if (n === null || n === undefined) return "—";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let i = 0, v = Number(n);
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i];
+}
+
+async function loadDisk() {
+  const d = await api("GET", "/api/disk");
+  const rows = [
+    ["Active videos", d.videos_active],
+    ["Orphaned folder", d.orphaned],
+    ["Data folder total", d.data_total],
+  ];
+  $("#disk-body").innerHTML = rows.map(([label, val]) =>
+    "<tr><td>" + label + "</td><td class='dim'>" + fmtBytes(val) + "</td></tr>").join("");
+  $("#disk-hint").textContent = (d.fs_free !== null && d.fs_free !== undefined)
+    ? "Volume: " + fmtBytes(d.fs_free) + " free of " + fmtBytes(d.fs_total)
+    : "";
+}
+
 function renderStatus(s) {
   $("#status-text").textContent = s.paused
     ? "Paused — no downloads will run until you flip the switch."
@@ -270,6 +303,39 @@ $("#paused-toggle").onchange = async (e) => {
     flash("settings-msg", err.message, false);
   }
 };
+
+async function doRefresh() {
+  const btn = $("#refresh-btn");
+  btn.disabled = true;
+  flash("refresh-msg", "Refreshing — checking all channels for new videos…");
+  try {
+    const r = await api("POST", "/api/refresh");
+    if (r.status === "already_running") {
+      flash("refresh-msg", "A refresh is already in progress…");
+    }
+    await pollRefresh();
+  } catch (err) {
+    flash("refresh-msg", err.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function pollRefresh() {
+  for (;;) {
+    const s = await api("GET", "/api/refresh");
+    if (!s.running) {
+      if (s.error) flash("refresh-msg", "Refresh failed: " + s.error, false);
+      else flash("refresh-msg", "Refresh complete.");
+      loadVideos();
+      loadDisk();
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+}
+
+$("#refresh-btn").onclick = doRefresh;
 
 $("#settings-form").onsubmit = async (e) => {
   e.preventDefault();
@@ -386,6 +452,7 @@ $("#add-video").onsubmit = async (e) => {
     await loadSettings();
     await loadChannels();
     await loadVideos();
+    await loadDisk();
   } catch (e) {
     document.body.innerHTML = "<p style='padding:2rem'>" + esc(e.message) + "</p>";
   }

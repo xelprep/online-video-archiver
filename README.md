@@ -5,22 +5,30 @@ A small Docker service that keeps the newest N videos from each configured chann
 ## Features
 
 - Password-locked web UI for managing channels and settings (password via the
-  `WEB_PASSWORD` env var; the app refuses to start without it).
+  `WEB_PASSWORD` env var; the app refuses to start if it is unset or left as an
+  example/placeholder value).
 - Starts **paused** on first run; nothing downloads until you unpause it.
 - Downloads the newest N videos per channel, where N is set per channel.
-- Polls each channel periodically for new uploads (channels with N=0 are skipped).
+- Polls each channel periodically for new uploads (channels with N=0 are skipped),
+  and a **Refresh now** button runs an immediate sync on demand.
 - Deletes older downloads so each channel retains only its newest N.
 - Channels, settings, and download state are stored in a SQLite database.
 - Saves videos as `ChannelName-PostDate-VideoTitle-VideoID.mp4` (the ID suffix makes
-  filename collisions impossible).
-- Limits source video to 1080p maximum and prefers H.264/AVC `avc1`, then H.265/HEVC `hvc1`.
+  filename collisions impossible); names are truncated by bytes so they never exceed
+  filesystem filename/path limits.
+- Limits source video to 1080p maximum and selects H.264/AVC `avc1` only (HEVC `hvc1`
+  and VP9/AV1 are never used, for broad Apple TV compatibility).
 - Uses AAC/M4A audio.
-- Uses FFmpeg only for container mux/remux; it does **not** transcode/re-encode.
+- Uses FFmpeg only for container mux/remux (with `+faststart`); it does **not**
+  transcode/re-encode.
+- Shows disk usage of the data volume (active videos, orphaned folder, free space).
 - Exposes a public `/health` endpoint on port 8080; everything else is behind the login.
 
 ## Quick start
 
-1. Set the web UI password in `docker-compose.yml` (`WEB_PASSWORD: "change-me"`).
+1. Set the web UI password in `docker-compose.yml`. Replace the `WEB_PASSWORD`
+   placeholder — the app **refuses to start** if it is unset or left as an example
+   value like `change-me`.
 
 2. Start:
 
@@ -50,9 +58,11 @@ docker compose logs -f
 
 ## Format/Apple TV behavior
 
-The downloader deliberately rejects VP9 and AV1 video streams and applies a hard 1080p maximum to the selected source video. Within that limit it prefers H.264/AVC (`avc1`) first, then HEVC (`hvc1`), paired with M4A/AAC audio. If the selected video/audio are separate streams, FFmpeg muxes them into MP4 without re-encoding.
+The downloader selects **H.264/AVC (`avc1`) only** and applies a hard 1080p maximum to the selected source video. HEVC (`hvc1`) and VP9/AV1 streams are deliberately rejected — older Apple TV models do not decode VP9, and the goal is broad compatibility rather than maximum quality. Audio is M4A/AAC.
 
-The service does not attempt to convert an incompatible video. If a video has no compatible `hvc1` or `avc1` MP4 stream, that video is logged as failed and retried on a later polling cycle.
+If the selected video and audio are separate streams, FFmpeg muxes them into MP4 **without re-encoding** (a remux, not a transcode) and writes the file with `+faststart` so the moov atom sits at the front and Apple TV can begin playback immediately. H.264 in an MP4 container with AAC audio is supported by every Apple TV 4K model.
+
+The service does not attempt to convert an incompatible video. If a video has no `avc1` MP4 stream at or below 1080p, that video is logged as failed and retried on a later polling cycle.
 
 ## Channels & settings
 
@@ -60,7 +70,11 @@ Everything is managed from the web UI at `http://localhost:8080` (sign in with
 the `WEB_PASSWORD` you set in `docker-compose.yml`):
 
 - **Status** — a switch that pauses/resumes all archiving (persisted; the app
-  starts paused on first run).
+  starts paused on first run), plus a **Refresh now** button that runs an immediate
+  sync cycle (handy right after adding a channel, instead of waiting for the next
+  poll).
+- **Storage** — disk usage of the data volume: active videos, the orphaned folder,
+  the data folder total, and free space on the volume.
 - **Settings** — poll interval and log level (persisted in the database).
 - **Channels** — add, edit, and remove channels. Each channel requires an
   explicit "keep latest N" (0 = keep only protected videos). Accepted URL
