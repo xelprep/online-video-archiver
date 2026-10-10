@@ -1,0 +1,64 @@
+name: Build and push Docker image
+
+# Builds the image on every push to main (and on demand) and pushes it to the
+# GitHub Container Registry. For public repositories GHCR storage and bandwidth
+# are free, so this costs nothing.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# `packages: write` lets the workflow push to GHCR using the built-in
+# GITHUB_TOKEN, so no extra secrets need to be configured.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  # Lowercased by GHCR convention; github.repository is already lowercase here.
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Emulate ARM so a single job can build both amd64 and arm64 images.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tag the image as `latest` (plus the commit sha for traceability).
+      - name: Extract metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Build for Intel/AMD and Apple Silicon so the image runs on both.
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Reuse the GitHub Actions cache to speed up rebuilds.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

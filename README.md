@@ -56,6 +56,35 @@ Follow logs:
 docker compose logs -f
 ```
 
+## Hosted image
+
+The Docker image is built automatically on every push to `main` and published to
+the GitHub Container Registry at
+`ghcr.io/xelprep/online-video-archiver` (tag `latest`). It is built for both
+`linux/amd64` and `linux/arm64`, so it runs on Intel/AMD and Apple Silicon
+hosts. You can pull it instead of building locally:
+
+```bash
+docker pull ghcr.io/xelprep/online-video-archiver:latest
+```
+
+To use it with `docker compose`, replace the `build: .` line in
+`docker-compose.yml` with:
+
+```yaml
+    image: ghcr.io/xelprep/online-video-archiver:latest
+```
+
+Or run it directly:
+
+```bash
+docker run -d --name online-video-archiver \
+  -e WEB_PASSWORD="change-me" \
+  -p 8080:8080 \
+  -v ./data:/data \
+  ghcr.io/xelprep/online-video-archiver:latest
+```
+
 ## Format/Apple TV behavior
 
 The downloader selects **H.264/AVC (`avc1`) only** and applies a hard 1080p maximum to the selected source video. HEVC (`hvc1`) and VP9/AV1 streams are deliberately rejected — older Apple TV models do not decode VP9, and the goal is broad compatibility rather than maximum quality. Audio is M4A/AAC.
