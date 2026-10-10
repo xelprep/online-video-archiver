@@ -16,13 +16,12 @@ from pathlib import Path
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VIDEO_DIR = DATA_DIR / "videos"
 DB_PATH = DATA_DIR / "archive.db"
 # Env vars provide *initial defaults only*; once the settings table holds a
 # value, it is the source of truth at runtime (B3).
-POLL_MINUTES_DEFAULT = max(1, int(os.getenv("POLL_MINUTES", "30")))
 LOG_LEVEL_DEFAULT = os.getenv("LOG_LEVEL", "INFO").upper()
 # How often the worker re-checks the paused flag while paused.
 PAUSE_POLL_SECONDS = 30
@@ -38,6 +37,22 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("yt-archiver")
+
+
+def _env_int(name, default):
+    # A10: a malformed env value must not crash startup — fall back to the
+    # default and warn instead of raising at import time.
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("Ignoring invalid integer for %s=%r; using %d", name, raw, default)
+        return default
+
+
+POLL_MINUTES_DEFAULT = max(1, _env_int("POLL_MINUTES", 30))
 
 app = Flask(__name__)
 app.config.update(
@@ -404,8 +419,18 @@ def download_video(channel_url, video_id, info=None):
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
     opts["postprocessors"] = [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}]
-    with YoutubeDL(opts) as ydl:
-        ydl.download([video_url])
+    try:
+        with YoutubeDL(opts) as ydl:
+            ydl.download([video_url])
+    except Exception:
+        # A10: a failed download can leave an orphaned hidden temp file; remove
+        # it (any extension) before propagating the error.
+        for leftover in channel_dir.glob(f".*-{video_id}.*"):
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
     candidates = list(channel_dir.glob(f".*-{video_id}.mp4"))
     if not candidates:
@@ -922,9 +947,10 @@ if __name__ == "__main__":
     init_db()
     seed_settings()
     apply_log_level()
-    # Run one synchronization immediately, then continue in the background.
-    # (While paused — the first-run default — this is a no-op.)
-    sync_all()
+    # A3: start the worker *before* the HTTP server. Its first action is an
+    # immediate sync, which now runs in the background so /health is reachable
+    # during the (potentially long) initial sync instead of only after it.
+    # While paused — the first-run default — that initial sync is a no-op.
     threading.Thread(target=worker, daemon=True, name="sync-worker").start()
     # Fixed port: remap via Docker (ports: "8090:8080"), not via env.
     app.run(host="0.0.0.0", port=8080)
