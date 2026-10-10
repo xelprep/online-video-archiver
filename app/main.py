@@ -348,10 +348,15 @@ def ydl_opts(download=False, outtmpl=None):
         # Remux (never re-encode) into MP4. -movflags +faststart moves the moov
         # atom to the front of the file so Apple TV can begin playback without
         # first downloading the whole file. No codec args => streams are copied.
+        # Extra FFmpeg args are passed via the top-level "postprocessor_args"
+        # dict (keyed by "<pp_key>+<exe>"), not per-postprocessor: yt-dlp
+        # 2026.8.19 removed the "additional_args" init parameter.
         "postprocessors": [
-            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4",
-             "additional_args": ["-movflags", "+faststart"]}
+            {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
         ],
+        "postprocessor_args": {
+            "videoremuxer+ffmpeg": ["-movflags", "+faststart"]
+        },
     }
     return opts
 
