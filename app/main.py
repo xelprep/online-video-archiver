@@ -13,10 +13,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, render_template, request, session, url_for
+from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from yt_dlp import YoutubeDL
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VIDEO_DIR = DATA_DIR / "videos"
 DB_PATH = DATA_DIR / "archive.db"
@@ -378,9 +378,10 @@ def record_video(channel_url, info, filepath):
         )
 
 
-def download_video(channel_url, video_id):
+def download_video(channel_url, video_id, info=None):
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    info = get_full_info(video_url)
+    if info is None:
+        info = get_full_info(video_url)
     if not info:
         raise RuntimeError(f"Could not extract metadata for {video_id}")
 
@@ -424,10 +425,13 @@ def download_video(channel_url, video_id):
 
 
 def enforce_retention(channel_url, latest_n):
+    # C1: protected videos are kept in addition to the N most recent and do not
+    # count toward N, so the N-most-recent selection considers only non-protected
+    # rows. Protected rows are never selected, hence never deleted.
     with db() as conn:
         rows = conn.execute(
             """SELECT id, filepath FROM videos
-               WHERE channel_url=?
+               WHERE channel_url=? AND protected=0
                ORDER BY CASE WHEN upload_date='' THEN 1 ELSE 0 END,
                         upload_date DESC, downloaded_at DESC""",
             (channel_url,),
@@ -522,6 +526,101 @@ def worker():
         except (TypeError, ValueError):
             poll_minutes = POLL_MINUTES_DEFAULT
         time.sleep(max(5, poll_minutes * 60 - elapsed))
+
+
+# ---------------------------------------------------------------------------
+# On-demand download by URL/ID (B8)
+# ---------------------------------------------------------------------------
+
+# In-memory registry of in-flight on-demand downloads (lost on restart, which is
+# fine — a completed download is persisted in the DB and on disk).
+download_tasks = {}
+download_tasks_lock = threading.Lock()
+
+
+def extract_video_id(url_or_id):
+    # Accepts a bare video ID or any common YouTube URL form.
+    s = (url_or_id or "").strip()
+    if not s:
+        return None
+    if "youtu" in s:
+        m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/|/live/)([A-Za-z0-9_-]{6,20})", s)
+        return m.group(1) if m else None
+    return s if re.fullmatch(r"[A-Za-z0-9_-]{6,20}", s) else None
+
+
+def resolve_or_add_channel(info):
+    # Derive the posting channel from the video's metadata. If it is not already
+    # in the master list, add it at latest_n=0 (tracked/visible but not actively
+    # synced). Returns the channel URL to associate the video with, or None.
+    name = info.get("channel") or info.get("uploader") or None
+    channel_id = info.get("channel_id") or info.get("uploader_id")
+    url = (info.get("uploader_url") or "").strip() or None
+    if not url and channel_id:
+        url = f"https://www.youtube.com/channel/{channel_id}"
+    if not url:
+        return None
+    url = url.rstrip("/")
+    with db() as conn:
+        row = conn.execute("SELECT url FROM channels WHERE url=?", (url,)).fetchone()
+        if row is not None:
+            return row["url"]
+        if name:
+            # Guard against a duplicate created via a different URL form (e.g. the
+            # user added @handle while we derived channel/UC...).
+            dup = conn.execute("SELECT url FROM channels WHERE name=?", (name,)).fetchone()
+            if dup is not None:
+                return dup["url"]
+        conn.execute(
+            "INSERT INTO channels (url, name, latest_n, added_at) VALUES (?, ?, 0, ?)",
+            (url, name, now_iso()),
+        )
+    return url
+
+
+def download_by_url(url_or_id):
+    # Download a specific video (B8). It is protected by default (C2) and its
+    # channel is auto-tracked at N=0 if not already present.
+    video_id = extract_video_id(url_or_id)
+    if not video_id:
+        raise ValueError("Could not parse a YouTube video ID from the input")
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    info = get_full_info(video_url)
+    if not info:
+        raise RuntimeError(f"Could not extract metadata for {video_id}")
+    channel_url = resolve_or_add_channel(info) or (
+        f"unknown:{info.get('channel') or info.get('uploader') or video_id}"
+    )
+    path = download_video(channel_url, video_id, info=info)
+    # video_id is globally unique on YouTube, so this is a safe, unambiguous key.
+    with db() as conn:
+        conn.execute("UPDATE videos SET protected=1 WHERE video_id=?", (video_id,))
+    return path
+
+
+def start_download_task(url_or_id):
+    task_id = secrets.token_hex(8)
+    task = {"id": task_id, "status": "running", "video_id": None,
+            "message": "Starting…", "error": None}
+    with download_tasks_lock:
+        download_tasks[task_id] = task
+    threading.Thread(target=_run_download_task, args=(task_id, url_or_id),
+                     daemon=True, name=f"download-{task_id}").start()
+    return task_id
+
+
+def _run_download_task(task_id, url_or_id):
+    def update(**fields):
+        with download_tasks_lock:
+            download_tasks[task_id].update(fields)
+    try:
+        video_id = extract_video_id(url_or_id)
+        update(video_id=video_id, message=f"Fetching metadata for {video_id}…")
+        download_by_url(url_or_id)
+        update(status="done", message="Download complete")
+    except Exception as exc:
+        log.exception("On-demand download failed: %s", url_or_id)
+        update(status="error", error=str(exc), message="Failed: " + str(exc))
 
 
 @app.get("/health")
@@ -725,9 +824,92 @@ def api_delete_channel():
 def api_videos():
     with db() as conn:
         rows = conn.execute(
-            "SELECT channel_name, video_id, title, upload_date, filepath, downloaded_at, protected FROM videos ORDER BY upload_date DESC, downloaded_at DESC"
+            "SELECT id, channel_name, video_id, title, upload_date, filepath, downloaded_at, protected FROM videos ORDER BY upload_date DESC, downloaded_at DESC"
         ).fetchall()
     return jsonify([dict(r) for r in rows])
+
+
+@app.patch("/api/videos")
+@require_auth
+@require_csrf
+def api_update_video():
+    # B7: toggle a video's "protect" flag. Protected videos are exempt from
+    # retention pruning (see enforce_retention / C1).
+    data = request.get_json(silent=True) or {}
+    vid = data.get("id")
+    if vid is None:
+        return jsonify({"error": "id is required"}), 400
+    if "protected" not in data:
+        return jsonify({"error": "nothing to update"}), 400
+    protected = 1 if data["protected"] else 0
+    with db() as conn:
+        cur = conn.execute("UPDATE videos SET protected=? WHERE id=?", (protected, vid))
+    if cur.rowcount == 0:
+        return jsonify({"error": "video not found"}), 404
+    return jsonify({"ok": True, "id": vid, "protected": bool(protected)})
+
+
+def resolve_video_path(video_id):
+    # Look up the stored file path for a video and verify it lives inside the
+    # video directory, so file serving can never escape the data dir (B9/B13).
+    with db() as conn:
+        row = conn.execute("SELECT filepath FROM videos WHERE id=?", (video_id,)).fetchone()
+    if row is None:
+        return None
+    path = Path(row["filepath"]).resolve()
+    try:
+        path.relative_to(VIDEO_DIR.resolve())
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    return path
+
+
+@app.get("/api/videos/<int:video_id>/file")
+@require_auth
+def api_video_file(video_id):
+    # B9 (inline, for the in-UI player) and B13 (attachment, to save to the
+    # user's machine) share this range-capable serving path; only the
+    # Content-Disposition differs. send_file(conditional=True) answers Range
+    # headers with HTTP 206 so seeking works.
+    path = resolve_video_path(video_id)
+    if path is None:
+        return jsonify({"error": "video file not found"}), 404
+    as_attachment = request.args.get("disposition") == "attachment"
+    return send_file(
+        path,
+        mimetype="video/mp4",
+        as_attachment=as_attachment,
+        download_name=path.name if as_attachment else None,
+        conditional=True,
+    )
+
+
+@app.post("/api/videos/download")
+@require_auth
+@require_csrf
+def api_start_download():
+    # B8: kick off an on-demand download in the background; the client polls
+    # /api/videos/download/<task_id> for progress.
+    data = request.get_json(silent=True) or {}
+    url_or_id = (data.get("url") or "").strip()
+    if not url_or_id:
+        return jsonify({"error": {"url": "Provide a YouTube video URL or ID"}}), 400
+    if not extract_video_id(url_or_id):
+        return jsonify({"error": {"url": "Could not parse a YouTube video URL or ID"}}), 400
+    task_id = start_download_task(url_or_id)
+    return jsonify({"task_id": task_id}), 202
+
+
+@app.get("/api/videos/download/<task_id>")
+@require_auth
+def api_download_status(task_id):
+    with download_tasks_lock:
+        task = download_tasks.get(task_id)
+    if task is None:
+        return jsonify({"error": "unknown task"}), 404
+    return jsonify(task)
 
 
 if __name__ == "__main__":

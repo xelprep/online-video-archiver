@@ -42,6 +42,11 @@
   a:hover { text-decoration: underline; }
   .row-actions { white-space: nowrap; }
   .row-actions button { margin-left: 0.4rem; padding: 0.25rem 0.6rem; font-size: 0.8rem; }
+  a.ghost { display: inline-block; padding: 0.25rem 0.6rem; border: 1px solid #2a2f3a; border-radius: 8px;
+            color: #cdd3de; font-size: 0.8rem; font-weight: 400; text-decoration: none; margin-left: 0.4rem; }
+  a.ghost:hover { background: #232833; }
+  .player-wrap { margin-top: 1rem; }
+  .player-wrap video { width: 100%; max-height: 420px; border-radius: 8px; background: #000; display: block; }
   .status-row { display: flex; align-items: center; gap: 1rem; }
   .status-row h2 { margin: 0; }
   .pill { padding: 0.15rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
@@ -124,6 +129,30 @@
     <table>
       <thead><tr><th>Channel</th><th>URL</th><th>Videos</th><th>Keep latest</th><th>Added</th><th></th></tr></thead>
       <tbody id="channels-body"></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Videos</h2>
+    <form id="add-video" class="grid">
+      <div class="grow">
+        <label for="video-url">Download a video by URL or ID</label>
+        <input type="text" id="video-url" placeholder="https://www.youtube.com/watch?v=… or a video ID">
+        <p class="hint">Downloaded on demand. The video is <b>protected by default</b> and its
+        channel is tracked (keep-latest 0) if not already added.</p>
+      </div>
+      <div class="form-actions">
+        <button type="submit" id="video-dl-btn">Download</button>
+      </div>
+    </form>
+    <p class="hint" id="video-msg"></p>
+    <div id="player-wrap" class="player-wrap" hidden>
+      <video id="player" controls></video>
+      <p class="dim" id="player-title"></p>
+    </div>
+    <table>
+      <thead><tr><th>Channel</th><th>Title</th><th>Uploaded</th><th>Protected</th><th></th></tr></thead>
+      <tbody id="videos-body"></tbody>
     </table>
   </section>
 </main>
@@ -273,10 +302,90 @@ $("#logout").onclick = async () => {
   location.href = "/login";
 };
 
+async function loadVideos() {
+  const videos = await api("GET", "/api/videos");
+  const tbody = $("#videos-body");
+  tbody.innerHTML = "";
+  for (const v of videos) {
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      '<td class="dim">' + esc(v.channel_name) + "</td>" +
+      '<td><a href="https://www.youtube.com/watch?v=' + esc(v.video_id) + '" target="_blank" rel="noopener">' +
+        esc(v.title) + "</a></td>" +
+      '<td class="dim">' + esc(v.upload_date || "") + "</td>" +
+      '<td><input type="checkbox" class="protect" title="Protect from pruning" ' +
+        (v.protected ? "checked" : "") + "></td>" +
+      '<td class="row-actions"><button class="ghost play">Play</button>' +
+      '<a class="ghost" href="/api/videos/' + v.id + '/file?disposition=attachment">Download</a></td>';
+    tr.querySelector(".protect").onchange = async (e) => {
+      try {
+        await api("PATCH", "/api/videos", { id: v.id, protected: e.target.checked });
+        flash("video-msg", e.target.checked ? "Video protected." : "Protection removed.");
+      } catch (err) {
+        e.target.checked = !e.target.checked;
+        flash("video-msg", err.message, false);
+      }
+    };
+    tr.querySelector(".play").onclick = () => playVideo(v);
+    tbody.appendChild(tr);
+  }
+  if (!videos.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="dim">No videos yet.</td></tr>';
+  }
+}
+
+function playVideo(v) {
+  const wrap = $("#player-wrap");
+  const player = $("#player");
+  player.src = "/api/videos/" + v.id + "/file";
+  $("#player-title").textContent = v.title;
+  wrap.hidden = false;
+  wrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  player.play().catch(() => {});
+}
+
+async function pollTask(taskId) {
+  const btn = $("#video-dl-btn");
+  for (;;) {
+    const t = await api("GET", "/api/videos/download/" + taskId);
+    flash("video-msg", t.message || t.status);
+    if (t.status === "done") {
+      btn.disabled = false;
+      flash("video-msg", "Download complete.");
+      loadVideos();
+      return;
+    }
+    if (t.status === "error") {
+      btn.disabled = false;
+      flash("video-msg", t.message || "Download failed.", false);
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+}
+
+$("#add-video").onsubmit = async (e) => {
+  e.preventDefault();
+  const url = $("#video-url").value;
+  if (!url.trim()) return;
+  const btn = $("#video-dl-btn");
+  btn.disabled = true;
+  flash("video-msg", "Starting download…");
+  try {
+    const { task_id } = await api("POST", "/api/videos/download", { url });
+    e.target.reset();
+    await pollTask(task_id);
+  } catch (err) {
+    btn.disabled = false;
+    flash("video-msg", err.message, false);
+  }
+};
+
 (async () => {
   try {
     await loadSettings();
     await loadChannels();
+    await loadVideos();
   } catch (e) {
     document.body.innerHTML = "<p style='padding:2rem'>" + esc(e.message) + "</p>";
   }
