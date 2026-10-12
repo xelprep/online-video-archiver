@@ -1,8 +1,11 @@
+import concurrent.futures
 import contextlib
 import functools
 import hashlib
+import json
 import logging
 import os
+import random
 import re
 import secrets
 import shutil
@@ -13,6 +16,8 @@ import sys
 import threading
 import time
 import traceback
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import make_msgid
@@ -20,6 +25,10 @@ from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
 from yt_dlp import YoutubeDL
+# The Python API expects an ImpersonateTarget object (not a raw string) for the
+# "impersonate" param — yt-dlp's CLI does this conversion itself, but the
+# YoutubeDL(params) constructor does not. Same import path the CLI uses.
+from yt_dlp.networking.impersonate import ImpersonateTarget
 
 APP_VERSION = "1.5.0"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -62,6 +71,56 @@ def _env_int(name, default):
 
 
 POLL_MINUTES_DEFAULT = max(1, _env_int("POLL_MINUTES", 30))
+
+# ---------------------------------------------------------------------------
+# Anti-detection: a consistent identity, human-like pacing, rate-limit handling
+# and TLS/browser impersonation. See dev/PLANNING-antidetect.md for the full
+# design and the verified yt-dlp behaviour these settings rely on.
+# ---------------------------------------------------------------------------
+# A single, common, current desktop-Chrome User-Agent. Used only when TLS
+# impersonation is OFF; when impersonation is ON, curl_cffi sends the
+# impersonated browser's own UA (which matches the TLS fingerprint), so we must
+# not override it — a UA/TLS mismatch is itself a bot signal.
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
+# Valid values for the tls_impersonate setting. "off" disables impersonation
+# (yt-dlp's default urllib backend is used).
+TLS_IMPERSONATE_CHOICES = ("off", "chrome", "safari", "firefox")
+# Valid values for the rate_limit_action setting.
+RATE_LIMIT_ACTIONS = ("abort", "backoff")
+# In "backoff" mode, abort the cycle after this many consecutive rate-limits so
+# a hard block does not turn into an endless sleep-and-retry loop.
+RATE_LIMIT_MAX_CONSECUTIVE = 3
+
+# ---------------------------------------------------------------------------
+# Phase 4 — adaptive public-SOCKS5 proxy rotation. When YouTube rate-limits the
+# direct egress IP, we reactively build a pool of vetted public SOCKS5 proxies
+# (two-phase: quick TLS connect, then a real extract+download) and route
+# downloads through them, rotating when a proxy stops working. We probe the
+# direct connection periodically and drop back to direct egress once the local
+# IP is no longer throttled. See dev/PLANNING-antidetect.md (spike results).
+# ---------------------------------------------------------------------------
+# ProxyScrape public-proxy API (no auth). The display_proxies JSON endpoint
+# returns per-proxy metadata (country, uptime, anonymity) we use to rank.
+PROXY_API_URL = "https://api.proxyscrape.com/v4/free-proxy-list/get"
+# A small, public, short video used to vet proxies (real extract + download)
+# and to probe whether the direct IP has recovered.
+PROXY_VET_VIDEO = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+# Where the vetted pool is persisted so a restart does not immediately re-vet.
+PROXY_POOL_PATH = DATA_DIR / "proxy_pool.json"
+# A persisted pool older than this is considered stale and re-vetted.
+PROXY_POOL_MAX_AGE = 24 * 3600
+# Parallelism + timeouts for the two-phase vetting sweep.
+PROXY_VET_WORKERS_QUICK = 30
+PROXY_VET_WORKERS_THOROUGH = 10
+PROXY_VET_THOROUGH_CAP = 60
+PROXY_QUICK_TIMEOUT = 6
+PROXY_THOROUGH_TIMEOUT = 25
+# Minimum seconds between vetting sweeps, so an exhausted pool does not trigger
+# a full re-sweep on every failed download.
+PROXY_VET_COOLDOWN = 300
 
 app = Flask(__name__)
 app.config.update(
@@ -152,6 +211,22 @@ def seed_settings():
         "paused": "1",  # B5: a fresh deploy starts paused
         "poll_minutes": str(POLL_MINUTES_DEFAULT),
         "log_level": LOG_LEVEL_DEFAULT,
+        # Anti-detection defaults (see dev/PLANNING-antidetect.md).
+        "user_agent": DEFAULT_USER_AGENT,
+        "download_delay_min": "5",
+        "download_delay_max": "20",
+        "rate_limit_action": "abort",
+        "rate_limit_backoff_seconds": "600",
+        "tls_impersonate": "chrome",
+        # Phase 4: SOCKS5 proxy rotation (see dev/PLANNING-antidetect.md).
+        # Off by default; the pool is built reactively only when the local IP
+        # is rate-limited. An empty country list means "all countries".
+        "proxy_enabled": "0",
+        "proxy_countries": "",
+        "proxy_timeout_ms": "3000",
+        "proxy_vet_limit": "300",
+        "proxy_recovery_probe_every": "10",
+        "proxy_max_rotations": "5",
     }
     with db() as conn:
         for key, value in defaults.items():
@@ -345,6 +420,34 @@ def get_settings():
         smtp_port = int(get_setting("smtp_port", "587") or 587)
     except (TypeError, ValueError):
         smtp_port = 587
+    try:
+        download_delay_min = int(get_setting("download_delay_min", "5"))
+    except (TypeError, ValueError):
+        download_delay_min = 5
+    try:
+        download_delay_max = int(get_setting("download_delay_max", "20"))
+    except (TypeError, ValueError):
+        download_delay_max = 20
+    try:
+        rate_limit_backoff_seconds = int(get_setting("rate_limit_backoff_seconds", "600"))
+    except (TypeError, ValueError):
+        rate_limit_backoff_seconds = 600
+    try:
+        proxy_timeout_ms = int(get_setting("proxy_timeout_ms", "3000"))
+    except (TypeError, ValueError):
+        proxy_timeout_ms = 3000
+    try:
+        proxy_vet_limit = int(get_setting("proxy_vet_limit", "300"))
+    except (TypeError, ValueError):
+        proxy_vet_limit = 300
+    try:
+        proxy_recovery_probe_every = int(get_setting("proxy_recovery_probe_every", "10"))
+    except (TypeError, ValueError):
+        proxy_recovery_probe_every = 10
+    try:
+        proxy_max_rotations = int(get_setting("proxy_max_rotations", "5"))
+    except (TypeError, ValueError):
+        proxy_max_rotations = 5
     return {
         "poll_minutes": poll_minutes,
         "log_level": get_setting("log_level", "INFO"),
@@ -356,6 +459,20 @@ def get_settings():
         "smtp_password": get_setting("smtp_password", ""),
         "smtp_from": get_setting("smtp_from", ""),
         "smtp_to": get_setting("smtp_to", ""),
+        # Anti-detection (see dev/PLANNING-antidetect.md).
+        "user_agent": get_setting("user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT,
+        "download_delay_min": download_delay_min,
+        "download_delay_max": download_delay_max,
+        "rate_limit_action": get_setting("rate_limit_action", "abort") or "abort",
+        "rate_limit_backoff_seconds": rate_limit_backoff_seconds,
+        "tls_impersonate": get_setting("tls_impersonate", "chrome") or "chrome",
+        # Phase 4: SOCKS5 proxy rotation.
+        "proxy_enabled": get_setting("proxy_enabled", "0") == "1",
+        "proxy_countries": get_setting("proxy_countries", "") or "",
+        "proxy_timeout_ms": proxy_timeout_ms,
+        "proxy_vet_limit": proxy_vet_limit,
+        "proxy_recovery_probe_every": proxy_recovery_probe_every,
+        "proxy_max_rotations": proxy_max_rotations,
     }
 
 
@@ -414,6 +531,349 @@ def output_template():
     return str(VIDEO_DIR / "%(uploader)s" / "%(upload_date)s-%(title)s.%(ext)s")
 
 
+class EgressManager:
+    """Chooses the outbound IP used for downloads.
+
+    DIRECT (default): connect directly.
+    PROXY: route through a vetted public-SOCKS5 proxy, rotating when a proxy
+    stops working. The pool is built *reactively* — only when YouTube
+    rate-limits the direct IP — by a two-phase vetting sweep (a quick TLS
+    connect, then a real extract+download). We probe the direct connection
+    periodically and drop back to DIRECT once the local IP is no longer
+    throttled. See dev/PLANNING-antidetect.md for the design and spike results.
+    """
+
+    DIRECT = "direct"
+    PROXY = "proxy"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = self.DIRECT
+        self._pool = []            # [{"ip","port","country","failures"}]
+        self._index = 0
+        self._consecutive_rotations = 0
+        self._downloads_since_probe = 0
+        self._last_vet_at = 0.0
+
+    # -- egress decision ---------------------------------------------------
+    def current_proxy(self):
+        # None => connect directly. A "socks5h://ip:port" URL routes through the
+        # active proxy (socks5h = remote DNS, for clean IP masking).
+        with self._lock:
+            if self._state != self.PROXY or not self._pool:
+                return None
+            entry = self._pool[self._index % len(self._pool)]
+            return f"socks5h://{entry['ip']}:{entry['port']}"
+
+    def on_rate_limited(self):
+        # React to a YouTube rate-limit. Returns "proxy" if a proxy is now
+        # active (the caller should retry the operation), else "none" (the
+        # caller applies the abort/backoff policy).
+        if not self._proxy_enabled():
+            return "none"
+        with self._lock:
+            if self._state == self.DIRECT:
+                # Reactive trigger: reuse a recent persisted pool if we have
+                # one, otherwise build a fresh one.
+                pool = self._load_pool()
+                if not pool:
+                    pool = self._vet_sweep()
+                    if pool:
+                        self._save_pool()
+                if not pool:
+                    return "none"
+                self._pool = pool
+                self._index = 0
+                self._state = self.PROXY
+                self._consecutive_rotations = 0
+                return "proxy"
+            # PROXY: rotate to the next proxy; re-vet once every proxy in the
+            # pool has been tried.
+            if not self._pool:
+                return "none"
+            self._rotate()
+            self._consecutive_rotations += 1
+            if self._consecutive_rotations >= len(self._pool):
+                pool = self._vet_sweep()
+                if not pool:
+                    return "none"
+                self._pool = pool
+                self._index = 0
+                self._consecutive_rotations = 0
+                self._save_pool()
+            return "proxy"
+
+    def on_proxy_failed(self):
+        # A proxy error (not a rate-limit): mark the current proxy failed and
+        # rotate to the next one.
+        with self._lock:
+            if self._state != self.PROXY or not self._pool:
+                return
+            entry = self._pool[self._index % len(self._pool)]
+            entry["failures"] = entry.get("failures", 0) + 1
+            self._rotate()
+
+    def on_success(self):
+        # Record a success. Periodically probe the direct connection; if the
+        # local IP is no longer throttled, drop back to DIRECT egress.
+        probe = False
+        with self._lock:
+            self._consecutive_rotations = 0
+            self._downloads_since_probe += 1
+            if self._state == self.PROXY and self._downloads_since_probe >= self._probe_every():
+                self._downloads_since_probe = 0
+                probe = True
+        if probe and self._probe_direct():
+            with self._lock:
+                self._state = self.DIRECT
+                self._pool = []
+                self._index = 0
+                self._consecutive_rotations = 0
+                self._downloads_since_probe = 0
+            self._clear_pool()
+            log.info("Direct egress recovered; leaving proxy mode")
+
+    def reset(self):
+        # Force direct egress and clear the pool (user-initiated).
+        with self._lock:
+            self._state = self.DIRECT
+            self._pool = []
+            self._index = 0
+            self._consecutive_rotations = 0
+            self._downloads_since_probe = 0
+        self._clear_pool()
+        log.info("Egress reset to direct")
+
+    def status(self):
+        with self._lock:
+            current = None
+            if self._state == self.PROXY and self._pool:
+                e = self._pool[self._index % len(self._pool)]
+                current = f"{e['ip']}:{e['port']}"
+            return {
+                "enabled": self._proxy_enabled(),
+                "state": self._state,
+                "pool_size": len(self._pool),
+                "current_proxy": current,
+                "consecutive_rotations": self._consecutive_rotations,
+                "last_vet_at": self._last_vet_at or None,
+            }
+
+    # -- internals ---------------------------------------------------------
+    def _rotate(self):
+        if self._pool:
+            self._index = (self._index + 1) % len(self._pool)
+
+    def _proxy_enabled(self):
+        return get_setting("proxy_enabled", "0") == "1"
+
+    def _probe_every(self):
+        try:
+            return max(1, int(get_setting("proxy_recovery_probe_every", "10")))
+        except (TypeError, ValueError):
+            return 10
+
+    def _fetch_proxies(self):
+        # Fetch candidate SOCKS5 proxies from ProxyScrape (display_proxies
+        # JSON). Returns a list of {"ip","port","country","failures"} dicts,
+        # deduped by ip:port. An empty country setting means "all countries".
+        countries = (get_setting("proxy_countries", "") or "").strip()
+        try:
+            timeout_ms = int(get_setting("proxy_timeout_ms", "3000"))
+        except (TypeError, ValueError):
+            timeout_ms = 3000
+        try:
+            limit = int(get_setting("proxy_vet_limit", "300"))
+        except (TypeError, ValueError):
+            limit = 300
+        params = {
+            "request": "display_proxies",
+            "proxy_format": "ipport",
+            "format": "json",
+            "protocol": "socks5",
+            "timeout": str(timeout_ms),
+            "limit": str(limit),
+        }
+        if countries:
+            params["country"] = countries
+        url = PROXY_API_URL + "?" + urllib.parse.urlencode(params)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            log.warning("Proxy fetch failed: %s", exc)
+            return []
+        seen = set()
+        out = []
+        for p in data.get("proxies", []):
+            ip = p.get("ip")
+            port = p.get("port")
+            if not ip or port is None:
+                continue
+            key = f"{ip}:{port}"
+            if key in seen:
+                continue
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                continue
+            seen.add(key)
+            country = (p.get("ip_data") or {}).get("countryCode", "")
+            out.append({"ip": ip, "port": port, "country": country, "failures": 0})
+        return out
+
+    def _vet_sweep(self):
+        # Two-phase parallel vetting. Returns a list of viable proxy entries,
+        # or [] if none. Respects a cooldown so an exhausted pool does not
+        # trigger a full re-sweep on every failed download.
+        now = time.time()
+        if now - self._last_vet_at < PROXY_VET_COOLDOWN:
+            return []
+        self._last_vet_at = now
+        proxies = self._fetch_proxies()
+        if not proxies:
+            log.warning("Proxy vetting: no proxies fetched")
+            return []
+        log.info("Proxy vetting: %d candidates", len(proxies))
+        passers = self._quick_connect(proxies)
+        log.info("Proxy vetting: %d quick-connect passers", len(passers))
+        if not passers:
+            return []
+        viable = self._thorough_vet(passers)
+        log.info("Proxy vetting: %d viable proxies", len(viable))
+        return viable
+
+    def _quick_connect(self, proxies):
+        # Phase A: a parallel TLS connect to youtube.com via each proxy. Any
+        # HTTP response (even 403/429) means the proxy can reach YouTube; only
+        # connection/proxy errors are failures.
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            log.warning("curl_cffi unavailable; cannot vet proxies")
+            return []
+
+        def check(p):
+            url = f"socks5h://{p['ip']}:{p['port']}"
+            try:
+                cffi_requests.get(
+                    "https://www.youtube.com",
+                    proxies={"http": url, "https": url},
+                    timeout=PROXY_QUICK_TIMEOUT,
+                    impersonate="chrome",
+                )
+                return p
+            except Exception:
+                return None
+
+        passers = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PROXY_VET_WORKERS_QUICK) as ex:
+            for p in ex.map(check, proxies):
+                if p is not None:
+                    passers.append(p)
+        return passers
+
+    def _thorough_vet(self, passers):
+        # Phase B: a real extract+download of a small video via each passer.
+        # Only proxies that complete the download are viable.
+        candidates = passers[:PROXY_VET_THOROUGH_CAP]
+        vet_dir = DATA_DIR / "tmp" / "proxy-vet"
+        vet_dir.mkdir(parents=True, exist_ok=True)
+
+        def vet(p):
+            url = f"socks5h://{p['ip']}:{p['port']}"
+            opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "impersonate": ImpersonateTarget.from_str("chrome"),
+                "proxy": url,
+                "socket_timeout": PROXY_THOROUGH_TIMEOUT,
+                "format": "bv*[height<=360]+ba/b[height<=360]",
+                "merge_output_format": "mp4",
+                "outtmpl": str(vet_dir / "%(title)s.%(ext)s"),
+                "paths": {"temp": str(vet_dir)},
+            }
+            try:
+                with YoutubeDL(opts) as ydl:
+                    ydl.extract_info(PROXY_VET_VIDEO, download=True)
+                return p
+            except Exception:
+                return None
+
+        viable = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=PROXY_VET_WORKERS_THOROUGH) as ex:
+            for p in ex.map(vet, candidates):
+                if p is not None:
+                    viable.append(p)
+        shutil.rmtree(vet_dir, ignore_errors=True)
+        return viable
+
+    def _probe_direct(self):
+        # A lightweight direct extraction (no proxy). Returns True if the
+        # direct IP is no longer rate-limited (i.e., we have recovered).
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "impersonate": ImpersonateTarget.from_str("chrome"),
+            "socket_timeout": 15,
+        }
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.extract_info(PROXY_VET_VIDEO, download=False)
+            return True
+        except Exception as exc:
+            # Only a definite rate-limit means "still throttled"; any other
+            # error is inconclusive, so stay in proxy mode to be safe.
+            return not is_rate_limited_error(exc)
+
+    def _save_pool(self):
+        try:
+            PROXY_POOL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            payload = {"verified_at": time.time(), "proxies": self._pool}
+            PROXY_POOL_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        except OSError as exc:
+            log.warning("Failed to save proxy pool: %s", exc)
+
+    def _load_pool(self):
+        # Load a persisted pool if it is recent enough. Returns a list of proxy
+        # entries, or [] if absent/stale/empty.
+        try:
+            payload = json.loads(PROXY_POOL_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        verified_at = payload.get("verified_at", 0)
+        if time.time() - verified_at > PROXY_POOL_MAX_AGE:
+            return []
+        proxies = payload.get("proxies", [])
+        if not proxies:
+            return []
+        log.info("Loaded %d persisted proxies (verified %ds ago)",
+                 len(proxies), int(time.time() - verified_at))
+        return proxies
+
+    def _clear_pool(self):
+        try:
+            PROXY_POOL_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+egress_manager = EgressManager()
+
+
+def _impersonate_target():
+    # TLS/browser impersonation via curl_cffi. "off" (or empty) disables it. A
+    # short client name ("chrome", "safari", "firefox") resolves to the newest
+    # matching curl_cffi target. Read per call so a settings change applies
+    # without a restart. Returns an ImpersonateTarget object (the type the
+    # Python API requires) or None when disabled.
+    target = (get_setting("tls_impersonate", "chrome") or "").strip().lower()
+    if target in ("", "off"):
+        return None
+    return ImpersonateTarget.from_str(target)
+
+
 def ydl_opts(download=False, outtmpl=None):
     # Apple-TV-friendly selection: H.264/AVC (avc1) only, never exceeding 1080p.
     # HEVC (hvc1) and VP9/AV1 are deliberately excluded — older Apple TV models
@@ -461,7 +921,25 @@ def ydl_opts(download=False, outtmpl=None):
         "postprocessor_args": {
             "videoremuxer+ffmpeg": ["-movflags", "+faststart"]
         },
+        # Phase 3: TLS/browser impersonation via curl_cffi. None disables it.
+        "impersonate": _impersonate_target(),
     }
+    # Phase 4: route through a proxy when the egress manager has one active.
+    # (No-op until Phase 4 lands; current_proxy() returns None today.)
+    proxy = egress_manager.current_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+    # Phase 1: when TLS impersonation is OFF, pin a consistent, common
+    # User-Agent so our requests look like one normal browser rather than
+    # yt-dlp's per-process random Chrome. When impersonation is ON we must NOT
+    # set a UA: curl_cffi sends the impersonated browser's own UA (matching the
+    # TLS fingerprint), and overriding it would create a UA/TLS mismatch —
+    # itself a bot signal. (The "user_agent" yt-dlp param is ignored by the
+    # Python API; only http_headers overrides the header.)
+    if opts["impersonate"] is None:
+        opts["http_headers"] = {
+            "User-Agent": get_setting("user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT,
+        }
     return opts
 
 
@@ -634,9 +1112,170 @@ def is_restricted_error(exc):
     return "members-only" in msg or "join this channel" in msg or "premium" in msg
 
 
+class RateLimitedError(Exception):
+    # Raised when YouTube rate-limits or blocks our requests (HTTP 429,
+    # "sign in to confirm your account", etc.). Distinct from a generic
+    # download failure so the sync loop can react (backoff/abort) instead of
+    # logging a full traceback and moving on.
+    pass
+
+
+def is_rate_limited_error(exc):
+    # YouTube signals rate-limiting / bot-detection with specific messages.
+    # Match on stable phrases (not a bare "429", which can appear in unrelated
+    # contexts) so we can react instead of treating it as an ordinary error.
+    msg = str(exc).lower()
+    return any(
+        phrase in msg
+        for phrase in (
+            "too many requests",
+            "http error 429",
+            "sign in to confirm",
+            "request is blocked",
+            "rate limit",
+        )
+    )
+
+
+def is_proxy_error(exc):
+    # A proxy-routed request can fail for reasons unrelated to YouTube: the
+    # SOCKS tunnel drops, the proxy can't reach the CDN, or curl_cffi reports a
+    # transport error. Match on stable phrases so a bad proxy triggers a
+    # rotation (on_proxy_failed) rather than being logged as an ordinary
+    # download failure.
+    msg = str(exc).lower()
+    return any(
+        phrase in msg
+        for phrase in (
+            "proxy",
+            "socks",
+            "tunnel connection failed",
+            "over proxy",
+            "curl: (7)",
+            "curl: (97)",
+            "curl: (35)",
+        )
+    )
+
+
+def _proxy_max_rotations():
+    # Per-operation retry cap so a single listing fetch or download can never
+    # loop forever if every proxy in the pool keeps failing.
+    try:
+        return max(0, int(get_setting("proxy_max_rotations", "5")))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _notify_rate_limited(context, channel_url, exc):
+    # Send a distinct email when we get rate-limited, throttled so a persistent
+    # block does not spam the inbox. Reuses the SMTP error-email path and its
+    # cooldown store (keyed separately from ordinary errors).
+    if not (get_setting("smtp_host") or "").strip():
+        return
+    key = f"rate-limited|{context}"
+    now = time.time()
+    with email_cooldown_lock:
+        last = email_cooldown.get(key)
+        if last is not None and now - last < EMAIL_COOLDOWN_SECONDS:
+            return
+        email_cooldown[key] = now
+    body = (
+        "YouTube rate-limited or blocked the archiver.\n\n"
+        f"Context: {context}\n"
+        f"Channel: {channel_url}\n"
+        f"Detail: {exc}\n\n"
+        f"---\n"
+        f"Time: {now_iso()}\n"
+        f"Host: {socket.gethostname()}\n"
+        f"Version: {APP_VERSION}\n"
+    )
+    ok, msg = send_email("[video-archiver] Rate limited / blocked", body)
+    if ok:
+        log.info("Rate-limit email sent")
+    else:
+        log.warning("Failed to send rate-limit email: %s", msg)
+
+
+def _handle_rate_limit(context, channel_url, exc, consecutive=1):
+    # React to a YouTube rate-limit / bot-detection signal. Returns:
+    #   "retry"  -> the egress manager rotated to a fresh proxy; retry the same
+    #               operation through it.
+    #   None     -> a backoff was applied; the caller continues.
+    # and raises RateLimitedError to abort the sync cycle (abort mode, or
+    # backoff mode after N consecutive limits).
+    action = (get_setting("rate_limit_action", "abort") or "abort").lower()
+    log.warning(
+        "Rate limited / blocked by YouTube during %s for %s: %s",
+        context, channel_url, exc,
+    )
+    _notify_rate_limited(context, channel_url, exc)
+    # Phase 4: let the egress manager rotate to a fresh IP if it is active.
+    if egress_manager.on_rate_limited() == "proxy":
+        log.info("Egress rotated to a proxy; retrying %s", context)
+        return "retry"
+    if action == "backoff":
+        try:
+            backoff = max(0, int(get_setting("rate_limit_backoff_seconds", "600")))
+        except (TypeError, ValueError):
+            backoff = 600
+        if consecutive >= RATE_LIMIT_MAX_CONSECUTIVE:
+            log.error(
+                "Rate limited %d times in a row; aborting sync cycle", consecutive
+            )
+            raise RateLimitedError(f"Rate limited {consecutive} consecutive times")
+        log.info("Backing off %ds before continuing", backoff)
+        time.sleep(backoff)
+    else:
+        raise RateLimitedError(f"Rate limited during {context}")
+    return None
+
+
+def _human_delay():
+    # Sleep a random interval between the configured min and max to mimic the
+    # irregular cadence of a human, rather than a tight bot loop. Read per call
+    # so a settings change applies without a restart.
+    try:
+        lo = max(0, int(get_setting("download_delay_min", "5")))
+        hi = max(0, int(get_setting("download_delay_max", "20")))
+    except (TypeError, ValueError):
+        lo, hi = 5, 20
+    if hi < lo:
+        lo, hi = hi, lo
+    delay = random.uniform(lo, hi)
+    if delay > 0:
+        log.debug("Human-like delay: sleeping %.1fs", delay)
+        time.sleep(delay)
+
+
 def sync_channel(channel_url, latest_n):
     log.info("Checking %s (latest_n=%d)", channel_url, latest_n)
-    entries = list_channel(channel_url, latest_n)
+    max_rotations = _proxy_max_rotations()
+    # Fetch the listing, retrying through a rotated proxy when the current
+    # egress is rate-limited or a proxy fails. Bounded so a bad pool can never
+    # loop forever.
+    rotations = 0
+    while True:
+        try:
+            entries = list_channel(channel_url, latest_n)
+            break
+        except Exception as exc:
+            if is_rate_limited_error(exc):
+                # A rate-limit while fetching the listing is a block signal,
+                # not a transient per-video error: react (rotate/backoff/abort).
+                if _handle_rate_limit("listing", channel_url, exc) == "retry" \
+                        and rotations < max_rotations:
+                    rotations += 1
+                    continue
+                raise
+            if is_proxy_error(exc):
+                # A bad proxy: rotate and retry through the next one.
+                egress_manager.on_proxy_failed()
+                if egress_manager.current_proxy() and rotations < max_rotations:
+                    rotations += 1
+                    continue
+                raise
+            raise
     # If the channel was added without a display name, learn it from metadata.
     if entries:
         resolved = entries[0].get("channel")
@@ -647,22 +1286,60 @@ def sync_channel(channel_url, latest_n):
                     conn.execute("UPDATE channels SET name=? WHERE url=?", (resolved, channel_url))
     # Process oldest -> newest so an interrupted initial sync leaves the newest
     # videos to be picked up on the next cycle.
+    consecutive_rate_limits = 0
     for entry in reversed(entries):
         if existing(channel_url, entry["id"]):
             continue
-        try:
-            path = download_video(channel_url, entry["id"])
-            log.info("Downloaded: %s", path.name)
-        except Exception as exc:
-            if is_restricted_error(exc):
-                # Auth-gated video: expected and permanent, so skip it with a
-                # clean warning instead of a full traceback.
-                log.warning(
-                    "Skipping %s (%s): not publicly available (members-only or premium-only)",
-                    entry["id"], entry["title"],
-                )
-            else:
+        # Per-video rotation budget: retry this video through a rotated proxy
+        # when the current egress is rate-limited or a proxy fails.
+        rotations = 0
+        while True:
+            try:
+                path = download_video(channel_url, entry["id"])
+                log.info("Downloaded: %s", path.name)
+                consecutive_rate_limits = 0
+                # Phase 4: record the success (drives the recovery probe).
+                egress_manager.on_success()
+                # Phase 1: human-like pause between downloads.
+                _human_delay()
+                break
+            except Exception as exc:
+                if is_rate_limited_error(exc):
+                    # Check rate-limiting before the restricted check: a block
+                    # signal must trigger rotation/backoff/abort, not a generic
+                    # error log.
+                    consecutive_rate_limits += 1
+                    result = _handle_rate_limit(
+                        "download", channel_url, exc,
+                        consecutive=consecutive_rate_limits,
+                    )
+                    if result == "retry" and rotations < max_rotations:
+                        rotations += 1
+                        continue
+                    # Backoff applied (move on) or abort (RateLimitedError
+                    # already raised inside _handle_rate_limit).
+                    break
+                if is_proxy_error(exc):
+                    # A bad proxy: rotate and retry this video through the next
+                    # one; if no proxy is left, treat it as an ordinary failure.
+                    egress_manager.on_proxy_failed()
+                    if egress_manager.current_proxy() and rotations < max_rotations:
+                        rotations += 1
+                        continue
+                    report_error(
+                        f"Failed downloading {entry['id']} ({entry['title']})", exc
+                    )
+                    break
+                if is_restricted_error(exc):
+                    # Auth-gated video: expected and permanent, so skip it with
+                    # a clean warning instead of a full traceback.
+                    log.warning(
+                        "Skipping %s (%s): not publicly available (members-only or premium-only)",
+                        entry["id"], entry["title"],
+                    )
+                    break
                 report_error(f"Failed downloading {entry['id']} ({entry['title']})", exc)
+                break
     enforce_retention(channel_url, latest_n)
 
 
@@ -674,6 +1351,11 @@ def _sync_channels():
             continue
         try:
             sync_channel(ch["url"], ch["latest_n"])
+        except RateLimitedError as exc:
+            # A rate-limit abort stops the whole cycle: continuing to hammer
+            # other channels from the same IP would only extend the block.
+            log.warning("Stopping sync cycle due to rate limiting: %s", exc)
+            break
         except Exception as exc:
             report_error(f"Channel sync failed: {ch['url']}", exc)
 
@@ -991,6 +1673,108 @@ def api_update_settings():
         set_setting("smtp_from", str(data["smtp_from"]).strip())
     if "smtp_to" in data:
         set_setting("smtp_to", str(data["smtp_to"]).strip())
+    # Anti-detection settings (see dev/PLANNING-antidetect.md).
+    if "user_agent" in data:
+        ua = str(data["user_agent"]).strip()
+        if not ua:
+            errors["user_agent"] = "cannot be empty"
+        else:
+            set_setting("user_agent", ua)
+    if "download_delay_min" in data:
+        try:
+            dmin = int(data["download_delay_min"])
+        except (TypeError, ValueError):
+            dmin = None
+            errors["download_delay_min"] = "must be an integer"
+        if dmin is not None and dmin < 0:
+            dmin = None
+            errors["download_delay_min"] = "must be >= 0"
+        if dmin is not None:
+            set_setting("download_delay_min", dmin)
+    if "download_delay_max" in data:
+        try:
+            dmax = int(data["download_delay_max"])
+        except (TypeError, ValueError):
+            dmax = None
+            errors["download_delay_max"] = "must be an integer"
+        if dmax is not None and dmax < 0:
+            dmax = None
+            errors["download_delay_max"] = "must be >= 0"
+        if dmax is not None:
+            set_setting("download_delay_max", dmax)
+    if "rate_limit_action" in data:
+        action = str(data["rate_limit_action"]).lower()
+        if action not in RATE_LIMIT_ACTIONS:
+            errors["rate_limit_action"] = "must be one of: " + ", ".join(RATE_LIMIT_ACTIONS)
+        else:
+            set_setting("rate_limit_action", action)
+    if "rate_limit_backoff_seconds" in data:
+        try:
+            backoff = int(data["rate_limit_backoff_seconds"])
+        except (TypeError, ValueError):
+            backoff = None
+            errors["rate_limit_backoff_seconds"] = "must be an integer"
+        if backoff is not None and backoff < 0:
+            backoff = None
+            errors["rate_limit_backoff_seconds"] = "must be >= 0"
+        if backoff is not None:
+            set_setting("rate_limit_backoff_seconds", backoff)
+    if "tls_impersonate" in data:
+        target = str(data["tls_impersonate"]).strip().lower()
+        if target not in TLS_IMPERSONATE_CHOICES:
+            errors["tls_impersonate"] = "must be one of: " + ", ".join(TLS_IMPERSONATE_CHOICES)
+        else:
+            set_setting("tls_impersonate", target)
+    # Phase 4: SOCKS5 proxy rotation (see dev/PLANNING-antidetect.md).
+    if "proxy_enabled" in data:
+        set_setting("proxy_enabled", "1" if data["proxy_enabled"] else "0")
+    if "proxy_countries" in data:
+        # Comma-separated ISO country codes; empty means "all countries".
+        set_setting("proxy_countries", str(data["proxy_countries"]).strip())
+    if "proxy_timeout_ms" in data:
+        try:
+            pto = int(data["proxy_timeout_ms"])
+        except (TypeError, ValueError):
+            pto = None
+            errors["proxy_timeout_ms"] = "must be an integer"
+        if pto is not None and pto < 1:
+            pto = None
+            errors["proxy_timeout_ms"] = "must be >= 1"
+        if pto is not None:
+            set_setting("proxy_timeout_ms", pto)
+    if "proxy_vet_limit" in data:
+        try:
+            pvl = int(data["proxy_vet_limit"])
+        except (TypeError, ValueError):
+            pvl = None
+            errors["proxy_vet_limit"] = "must be an integer"
+        if pvl is not None and pvl < 1:
+            pvl = None
+            errors["proxy_vet_limit"] = "must be >= 1"
+        if pvl is not None:
+            set_setting("proxy_vet_limit", pvl)
+    if "proxy_recovery_probe_every" in data:
+        try:
+            pre = int(data["proxy_recovery_probe_every"])
+        except (TypeError, ValueError):
+            pre = None
+            errors["proxy_recovery_probe_every"] = "must be an integer"
+        if pre is not None and pre < 1:
+            pre = None
+            errors["proxy_recovery_probe_every"] = "must be >= 1"
+        if pre is not None:
+            set_setting("proxy_recovery_probe_every", pre)
+    if "proxy_max_rotations" in data:
+        try:
+            pmr = int(data["proxy_max_rotations"])
+        except (TypeError, ValueError):
+            pmr = None
+            errors["proxy_max_rotations"] = "must be an integer"
+        if pmr is not None and pmr < 0:
+            pmr = None
+            errors["proxy_max_rotations"] = "must be >= 0"
+        if pmr is not None:
+            set_setting("proxy_max_rotations", pmr)
     if errors:
         return jsonify({"error": errors}), 400
     return jsonify(get_settings())
@@ -1011,6 +1795,23 @@ def api_test_email():
     if ok:
         return jsonify({"ok": True, "message": "Test email sent — check your inbox."})
     return jsonify({"ok": False, "message": msg}), 400
+
+
+@app.get("/api/proxy")
+@require_auth
+def api_proxy_status():
+    # Live egress state: direct vs proxy, pool size, active proxy, and when the
+    # pool was last vetted. Read-only; the UI polls this to render the status.
+    return jsonify(egress_manager.status())
+
+
+@app.post("/api/proxy/reset")
+@require_auth
+@require_csrf
+def api_proxy_reset():
+    # Force direct egress and clear the vetted pool (user-initiated).
+    egress_manager.reset()
+    return jsonify(egress_manager.status())
 
 
 @app.get("/api/channels")

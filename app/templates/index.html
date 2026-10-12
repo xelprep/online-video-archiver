@@ -61,6 +61,9 @@
   .switch input:checked + .slider::before { transform: translateX(20px); background: #fff; }
   .subhead { font-size: 0.9rem; margin: 1.5rem 0 0.25rem; color: #cdd3de; }
   .settings-actions { display: flex; gap: 0.5rem; align-items: center; margin-top: 1rem; }
+  .switch-row { display: flex; align-items: center; gap: 0.6rem; }
+  .switch-row label { margin: 0; color: #cdd3de; }
+  .proxy-status { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: 0.75rem; }
   th.sortable { cursor: pointer; user-select: none; }
   th.sortable:hover { color: #cdd3de; }
   .filter-row th { border-top: 0; padding-top: 0; }
@@ -114,6 +117,87 @@
             <option>ERROR</option><option>CRITICAL</option>
           </select>
         </div>
+      </div>
+
+      <h3 class="subhead">Anti-detection &amp; rate limiting</h3>
+      <p class="hint">Makes downloads look like a normal human browser: a consistent
+      identity, human-like pauses between downloads, and a response when YouTube
+      rate-limits us. <b>TLS impersonation</b> (recommended) makes the TLS handshake
+      match a real browser; when it's <b>off</b>, the fixed <b>User-Agent</b> below is
+      sent instead.</p>
+      <div class="grid">
+        <div>
+          <label for="tls_impersonate">TLS impersonation</label>
+          <select id="tls_impersonate" name="tls_impersonate">
+            <option value="chrome">Chrome (recommended)</option>
+            <option value="safari">Safari</option>
+            <option value="firefox">Firefox</option>
+            <option value="off">Off</option>
+          </select>
+        </div>
+        <div class="grow">
+          <label for="user_agent">User-Agent (used when impersonation is off)</label>
+          <input type="text" id="user_agent" name="user_agent" spellcheck="false">
+        </div>
+        <div>
+          <label for="download_delay_min">Pause between downloads, min (s)</label>
+          <input type="number" id="download_delay_min" name="download_delay_min" min="0" step="1">
+        </div>
+        <div>
+          <label for="download_delay_max">Pause between downloads, max (s)</label>
+          <input type="number" id="download_delay_max" name="download_delay_max" min="0" step="1">
+        </div>
+        <div>
+          <label for="rate_limit_action">When rate-limited</label>
+          <select id="rate_limit_action" name="rate_limit_action">
+            <option value="abort">Stop this sync cycle</option>
+            <option value="backoff">Wait, then continue</option>
+          </select>
+        </div>
+        <div>
+          <label for="rate_limit_backoff_seconds">Backoff wait (seconds)</label>
+          <input type="number" id="rate_limit_backoff_seconds" name="rate_limit_backoff_seconds" min="0" step="1">
+        </div>
+      </div>
+
+      <h3 class="subhead">Proxy rotation (SOCKS5)</h3>
+      <p class="hint">When YouTube rate-limits your IP, the archiver can route downloads
+      through a vetted public SOCKS5 proxy and rotate when one stops working. The pool is
+      built <b>only when needed</b> (reactively) and the archiver probes your direct
+      connection periodically, dropping back to it once you're no longer throttled.
+      <b>Off by default.</b></p>
+      <div class="grid">
+        <div class="switch-row">
+          <label class="switch" title="Enable SOCKS5 proxy rotation">
+            <input type="checkbox" id="proxy_enabled" name="proxy_enabled">
+            <span class="slider"></span>
+          </label>
+          <span>Enable proxy rotation</span>
+        </div>
+        <div class="grow">
+          <label for="proxy_countries">Countries (comma-separated; blank = all)</label>
+          <input type="text" id="proxy_countries" name="proxy_countries" placeholder="e.g. US,CA,MX" spellcheck="false">
+        </div>
+        <div>
+          <label for="proxy_timeout_ms">Proxy timeout (ms)</label>
+          <input type="number" id="proxy_timeout_ms" name="proxy_timeout_ms" min="1" step="1">
+        </div>
+        <div>
+          <label for="proxy_vet_limit">Max proxies to vet</label>
+          <input type="number" id="proxy_vet_limit" name="proxy_vet_limit" min="1" step="1">
+        </div>
+        <div>
+          <label for="proxy_recovery_probe_every">Recovery probe every N downloads</label>
+          <input type="number" id="proxy_recovery_probe_every" name="proxy_recovery_probe_every" min="1" step="1">
+        </div>
+        <div>
+          <label for="proxy_max_rotations">Max rotations per operation</label>
+          <input type="number" id="proxy_max_rotations" name="proxy_max_rotations" min="0" step="1">
+        </div>
+      </div>
+      <div class="proxy-status">
+        <span id="proxy-status-text" class="hint">Egress: …</span>
+        <button type="button" id="proxy-reset-btn" class="ghost">Reset to direct</button>
       </div>
 
       <h3 class="subhead">Error email (SMTP)</h3>
@@ -304,6 +388,12 @@ async function loadSettings() {
   renderStatus(s);
   $("#poll_minutes").value = s.poll_minutes;
   $("#log_level").value = s.log_level;
+  $("#tls_impersonate").value = s.tls_impersonate || "chrome";
+  $("#user_agent").value = s.user_agent || "";
+  $("#download_delay_min").value = s.download_delay_min ?? "";
+  $("#download_delay_max").value = s.download_delay_max ?? "";
+  $("#rate_limit_action").value = s.rate_limit_action || "abort";
+  $("#rate_limit_backoff_seconds").value = s.rate_limit_backoff_seconds ?? "";
   $("#smtp_host").value = s.smtp_host || "";
   $("#smtp_port").value = s.smtp_port || "";
   $("#smtp_encryption").value = s.smtp_encryption || "starttls";
@@ -311,7 +401,44 @@ async function loadSettings() {
   $("#smtp_password").value = s.smtp_password || "";
   $("#smtp_from").value = s.smtp_from || "";
   $("#smtp_to").value = s.smtp_to || "";
+  $("#proxy_enabled").checked = !!s.proxy_enabled;
+  $("#proxy_countries").value = s.proxy_countries || "";
+  $("#proxy_timeout_ms").value = s.proxy_timeout_ms ?? "";
+  $("#proxy_vet_limit").value = s.proxy_vet_limit ?? "";
+  $("#proxy_recovery_probe_every").value = s.proxy_recovery_probe_every ?? "";
+  $("#proxy_max_rotations").value = s.proxy_max_rotations ?? "";
 }
+
+async function loadProxyStatus() {
+  try {
+    const p = await api("GET", "/api/proxy");
+    const el = $("#proxy-status-text");
+    if (!p.enabled) {
+      el.textContent = "Proxy rotation is off.";
+    } else if (p.state === "proxy") {
+      el.textContent = "Routing via proxy " + (p.current_proxy || "…") +
+        " (" + p.pool_size + " in pool, " + p.consecutive_rotations + " rotations).";
+    } else {
+      el.textContent = "Direct egress (proxy pool: " + p.pool_size + ").";
+    }
+  } catch (e) {
+    $("#proxy-status-text").textContent = "Egress: " + e.message;
+  }
+}
+
+$("#proxy-reset-btn").onclick = async () => {
+  const btn = $("#proxy-reset-btn");
+  btn.disabled = true;
+  try {
+    await api("POST", "/api/proxy/reset", {});
+    flash("settings-msg", "Egress reset to direct.");
+    loadProxyStatus();
+  } catch (e) {
+    flash("settings-msg", e.message, false);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 async function loadChannels() {
   const channels = await api("GET", "/api/channels");
@@ -406,6 +533,7 @@ async function pollRefresh() {
       else flash("refresh-msg", "Refresh complete.");
       loadVideos();
       loadDisk();
+      loadProxyStatus();
       return;
     }
     await new Promise((r) => setTimeout(r, 3000));
@@ -418,6 +546,12 @@ async function saveSettings() {
   return api("PUT", "/api/settings", {
     poll_minutes: parseInt($("#poll_minutes").value, 10),
     log_level: $("#log_level").value,
+    tls_impersonate: $("#tls_impersonate").value,
+    user_agent: $("#user_agent").value,
+    download_delay_min: parseInt($("#download_delay_min").value, 10),
+    download_delay_max: parseInt($("#download_delay_max").value, 10),
+    rate_limit_action: $("#rate_limit_action").value,
+    rate_limit_backoff_seconds: parseInt($("#rate_limit_backoff_seconds").value, 10),
     smtp_host: $("#smtp_host").value,
     smtp_port: parseInt($("#smtp_port").value, 10),
     smtp_encryption: $("#smtp_encryption").value,
@@ -425,6 +559,12 @@ async function saveSettings() {
     smtp_password: $("#smtp_password").value,
     smtp_from: $("#smtp_from").value,
     smtp_to: $("#smtp_to").value,
+    proxy_enabled: $("#proxy_enabled").checked,
+    proxy_countries: $("#proxy_countries").value,
+    proxy_timeout_ms: parseInt($("#proxy_timeout_ms").value, 10),
+    proxy_vet_limit: parseInt($("#proxy_vet_limit").value, 10),
+    proxy_recovery_probe_every: parseInt($("#proxy_recovery_probe_every").value, 10),
+    proxy_max_rotations: parseInt($("#proxy_max_rotations").value, 10),
   });
 }
 
@@ -622,6 +762,7 @@ $("#add-video").onsubmit = async (e) => {
 (async () => {
   try {
     await loadSettings();
+    await loadProxyStatus();
     await loadChannels();
     await loadVideos();
     await loadDisk();

@@ -22,6 +22,13 @@ A small Docker service that keeps the newest N videos from each configured chann
 - Uses FFmpeg only for container mux/remux (with `+faststart`); it does **not**
   transcode/re-encode.
 - Shows disk usage of the data volume (active videos, orphaned folder, free space).
+- Anti-detection: a realistic browser User-Agent, randomized human-like delays
+  between downloads, optional Chrome TLS-fingerprint impersonation, and
+  configurable handling of YouTube rate limits (back off and retry, or abort).
+- Optional SOCKS5 proxy rotation: if the local IP gets rate-limited, the app
+  reactively builds a vetted pool of public SOCKS5 proxies and routes downloads
+  through them until the local IP is allowed again, then drops back to direct
+  egress automatically.
 - Exposes a public `/health` endpoint on port 8080; everything else is behind the login.
 
 ## Quick start
@@ -104,7 +111,9 @@ the `WEB_PASSWORD` you set in `docker-compose.yml`):
   poll).
 - **Storage** — disk usage of the data volume: active videos, the orphaned folder,
   the data folder total, and free space on the volume.
-- **Settings** — poll interval and log level (persisted in the database).
+- **Settings** — poll interval, log level, anti-detection options, and proxy
+  rotation (persisted in the database; see
+  [Anti-detection & proxy rotation](#anti-detection--proxy-rotation)).
 - **Channels** — add, edit, and remove channels. Each channel requires an
   explicit "keep latest N" (0 = keep only protected videos). Accepted URL
   formats: `@handle`, `https://www.youtube.com/@handle`,
@@ -133,6 +142,53 @@ UPDATE settings SET value = '0' WHERE key = 'paused';
 Each channel stores its own `latest_n` in the `channels` table — there is no
 global default. A channel with `latest_n = 0` is skipped by the scheduled poll;
 it only keeps videos that are explicitly protected.
+
+## Anti-detection & proxy rotation
+
+YouTube rate-limits and bot-detects based on the TLS handshake fingerprint, the
+User-Agent, request pacing, and the egress IP. The archiver addresses the first
+three with always-on defaults, and the fourth with an optional proxy rotation.
+All of these are configurable in the **Settings** card of the web UI.
+
+### Anti-detection (on by default)
+
+- **User-Agent** — a current desktop Chrome UA string is sent with every
+  request (editable in Settings).
+- **Human-like pacing** — a random delay (default 5–20 s) is inserted between
+  downloads, so the request pattern does not look like a scripted loop.
+- **TLS impersonation** — downloads go through `curl_cffi` impersonating a
+  Chrome TLS/JA3 fingerprint, which is the strongest single bot signal. Can be
+  switched off in Settings (in which case the User-Agent above is pinned).
+- **Rate-limit handling** — when YouTube returns a 429 / "Sign in to confirm
+  you're not a bot" response, the app either **aborts** the sync cycle (default)
+  or **backs off** for a configurable number of seconds and retries, up to a
+  small number of consecutive attempts.
+
+### Proxy rotation (off by default)
+
+If your host IP gets persistently rate-limited, you can enable SOCKS5 proxy
+rotation. It is deliberately **reactive**: nothing is fetched or tested until
+the local IP is actually rate-limited, at which point the app:
+
+1. Fetches a batch of public SOCKS5 proxies (ProxyScrape), optionally filtered
+   by country (`proxy_countries`; empty = all countries).
+2. Vets them in parallel with a short timeout, keeping only proxies that
+   actually connect.
+3. Routes downloads through the vetted pool, rotating to the next proxy when
+   one fails (bounded per operation).
+4. Periodically probes the direct connection after successful downloads and
+   drops back to direct egress once the local IP is no longer throttled.
+
+The vetted pool is cached on the data volume for 24 h so restarts do not
+re-vet. The current egress state (direct vs. proxy, pool size, current proxy)
+is shown in the Settings card, and a **Reset to direct** button forces the app
+back to its own IP immediately.
+
+> **Caveat:** public SOCKS5 proxies are a low-quality pool — testing found
+> only a small fraction of fetched proxies actually work, and they are
+> ephemeral. Treat this as a way to *keep archiving* while your local IP is
+> throttled, not a high-reliability egress. If you have your own residential
+> or VPN exit IPs, a static proxy or VPN is a more robust option.
 
 ## Notes
 
