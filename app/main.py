@@ -251,6 +251,9 @@ def seed_settings():
         "paused": "1",  # B5: a fresh deploy starts paused
         "poll_minutes": str(POLL_MINUTES_DEFAULT),
         "log_level": LOG_LEVEL_DEFAULT,
+        # Log-viewer toggles (see apply_http_log_setting / apply_ydl_log_setting).
+        "http_logs": "1",
+        "ydl_verbose": "0",
         # Anti-detection defaults (see dev/PLANNING-antidetect.md).
         "user_agent": DEFAULT_USER_AGENT,
         "download_delay_min": "5",
@@ -282,6 +285,33 @@ def apply_log_level():
         logging.getLogger().setLevel(str(get_setting("log_level", "INFO")).upper())
     except ValueError:
         pass
+
+
+# Dedicated logger for yt-dlp. We pass this to every YoutubeDL instance so its
+# output (status, format selection, download progress) is emitted through the
+# Python logging system instead of straight to stdout — otherwise the web Logs
+# tab (which reads the logging system) never sees it. yt-dlp emits all of its
+# screen output at DEBUG, so the "verbose yt-dlp" toggle below raises this
+# logger to DEBUG to reveal it, independently of the global log level.
+ydl_logger = logging.getLogger("yt_dlp")
+
+
+def apply_http_log_setting():
+    # Werkzeug logs every HTTP request (healthchecks, page loads, the SSE log
+    # stream) at INFO on the "werkzeug" logger. When the user turns HTTP logs
+    # off we raise that logger to ERROR so the request lines are filtered out
+    # while genuine errors still show.
+    enabled = get_setting("http_logs", "1") == "1"
+    logging.getLogger("werkzeug").setLevel(logging.INFO if enabled else logging.ERROR)
+
+
+def apply_ydl_log_setting():
+    # yt-dlp emits all of its screen output at DEBUG. Off by default (WARNING)
+    # so the Logs tab stays quiet; the "verbose yt-dlp" toggle raises it to
+    # DEBUG to reveal status/progress. Set on the yt_dlp logger directly so it
+    # is independent of the global log level.
+    verbose = get_setting("ydl_verbose", "0") == "1"
+    ydl_logger.setLevel(logging.DEBUG if verbose else logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +521,8 @@ def get_settings():
     return {
         "poll_minutes": poll_minutes,
         "log_level": get_setting("log_level", "INFO"),
+        "http_logs": get_setting("http_logs", "1") == "1",
+        "ydl_verbose": get_setting("ydl_verbose", "0") == "1",
         "paused": is_paused(),
         "smtp_host": get_setting("smtp_host", ""),
         "smtp_port": smtp_port,
@@ -964,6 +996,12 @@ def ydl_opts(download=False, outtmpl=None):
         # Phase 3: TLS/browser impersonation via curl_cffi. None disables it.
         "impersonate": _impersonate_target(),
     }
+    # Route yt-dlp's own output (status, format selection, download progress)
+    # through the logging system so the web Logs tab can show it. Without a
+    # logger, yt-dlp writes straight to stdout, which the log stream never sees.
+    # yt-dlp emits all of this at DEBUG; the "verbose yt-dlp" toggle (see
+    # apply_ydl_log_setting) raises ydl_logger to DEBUG to reveal it.
+    opts["logger"] = ydl_logger
     # Phase 4: route through a proxy when the egress manager has one active.
     # (No-op until Phase 4 lands; current_proxy() returns None today.)
     proxy = egress_manager.current_proxy()
@@ -1521,6 +1559,8 @@ def worker():
     while True:
         paused = is_paused()
         apply_log_level()
+        apply_http_log_setting()
+        apply_ydl_log_setting()
         started = time.monotonic()
         try:
             sync_all()
@@ -1830,6 +1870,12 @@ def api_update_settings():
         else:
             set_setting("log_level", level)
             apply_log_level()
+    if "http_logs" in data:
+        set_setting("http_logs", "1" if data["http_logs"] else "0")
+        apply_http_log_setting()
+    if "ydl_verbose" in data:
+        set_setting("ydl_verbose", "1" if data["ydl_verbose"] else "0")
+        apply_ydl_log_setting()
     if "paused" in data:
         set_setting("paused", "1" if data["paused"] else "0")
     # SMTP / error-email settings.
@@ -2229,6 +2275,8 @@ if __name__ == "__main__":
     init_db()
     seed_settings()
     apply_log_level()
+    apply_http_log_setting()
+    apply_ydl_log_setting()
     # A3: start the worker *before* the HTTP server. Its first action is an
     # immediate sync, which now runs in the background so /health is reachable
     # during the (potentially long) initial sync instead of only after it.

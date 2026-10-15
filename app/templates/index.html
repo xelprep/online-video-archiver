@@ -150,6 +150,16 @@
           </select>
         </div>
       </div>
+      <div class="grid">
+        <div>
+          <label><input type="checkbox" id="http_logs" name="http_logs"> Show HTTP request logs</label>
+          <span class="hint">Off hides per-request lines (healthchecks, page loads) from the Logs tab.</span>
+        </div>
+        <div>
+          <label><input type="checkbox" id="ydl_verbose" name="ydl_verbose"> Verbose yt-dlp output</label>
+          <span class="hint">On reveals yt-dlp status and download progress (very chatty).</span>
+        </div>
+      </div>
 
       <h3 class="subhead">Anti-detection &amp; rate limiting</h3>
       <p class="hint">Makes downloads look like a normal human browser: a consistent
@@ -473,6 +483,8 @@ async function loadSettings() {
   renderStatus(s);
   $("#poll_minutes").value = s.poll_minutes;
   $("#log_level").value = s.log_level;
+  $("#http_logs").checked = !!s.http_logs;
+  $("#ydl_verbose").checked = !!s.ydl_verbose;
   $("#tls_impersonate").value = s.tls_impersonate || "chrome";
   $("#user_agent").value = s.user_agent || "";
   $("#download_delay_min").value = s.download_delay_min ?? "";
@@ -631,6 +643,8 @@ async function saveSettings() {
   return api("PUT", "/api/settings", {
     poll_minutes: parseInt($("#poll_minutes").value, 10),
     log_level: $("#log_level").value,
+    http_logs: $("#http_logs").checked,
+    ydl_verbose: $("#ydl_verbose").checked,
     tls_impersonate: $("#tls_impersonate").value,
     user_agent: $("#user_agent").value,
     download_delay_min: parseInt($("#download_delay_min").value, 10),
