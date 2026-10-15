@@ -103,21 +103,27 @@ The service does not attempt to convert an incompatible video. If a video has no
 ## Channels & settings
 
 Everything is managed from the web UI at `http://localhost:8080` (sign in with
-the `WEB_PASSWORD` you set in `docker-compose.yml`):
+the `WEB_PASSWORD` you set in `docker-compose.yml`). The interface is split into
+five tabs:
 
 - **Status** — a switch that pauses/resumes all archiving (persisted; the app
   starts paused on first run), plus a **Refresh now** button that runs an immediate
   sync cycle (handy right after adding a channel, instead of waiting for the next
-  poll).
-- **Storage** — disk usage of the data volume: active videos, the orphaned folder,
-  the data folder total, and free space on the volume.
-- **Settings** — poll interval, log level, anti-detection options, and proxy
-  rotation (persisted in the database; see
-  [Anti-detection & proxy rotation](#anti-detection--proxy-rotation)).
+  poll). Also shows the app and yt-dlp versions, current uptime, and disk usage of
+  the data volume (active videos, the orphaned folder, the data folder total, and
+  free space on the volume).
 - **Channels** — add, edit, and remove channels. Each channel requires an
   explicit "keep latest N" (0 = keep only protected videos). Accepted URL
   formats: `@handle`, `https://www.youtube.com/@handle`,
   `https://www.youtube.com/channel/UC...`.
+- **Videos** — download a video by URL or ID on demand, play or download any
+  archived video, and toggle per-video protection from pruning.
+- **Settings** — poll interval, log level, anti-detection options, and proxy
+  rotation (persisted in the database; see
+  [Anti-detection & proxy rotation](#anti-detection--proxy-rotation)).
+- **Logs** — a live, auto-scrolling stream of the app's log output (recent
+  history plus new lines as they happen, over Server-Sent Events). The **Clear**
+  button empties the view; the stream respects the log level set in Settings.
 
 Removing a channel deletes it from the database and moves its downloaded files
 into `./data/videos/orphaned/` (renamed with an `-orphaned-<timestamp>` suffix).

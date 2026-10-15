@@ -9,11 +9,19 @@
   * { box-sizing: border-box; }
   body { margin: 0; background: #0f1115; color: #e6e6e6;
          font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-  header { display: flex; align-items: center; justify-content: space-between;
-           padding: 1rem 1.5rem; border-bottom: 1px solid #232833; }
+  header { padding: 0 1.5rem; border-bottom: 1px solid #232833; }
+  .header-top { display: flex; align-items: center; justify-content: space-between;
+                padding: 1rem 0 0.5rem; }
   header h1 { font-size: 1.1rem; margin: 0; }
   .version { color: #555c6b; font-size: 0.8rem; font-weight: 400; }
-  main { max-width: 960px; margin: 0 auto; padding: 1.5rem; display: grid; gap: 1.25rem; }
+  .tabs { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+  .tab { background: transparent; border: 0; border-bottom: 2px solid transparent;
+         color: #8b93a3; padding: 0.5rem 0.9rem; font: inherit; font-weight: 600; cursor: pointer; }
+  .tab:hover { color: #cdd3de; background: transparent; }
+  .tab.active { color: #e6e6e6; border-bottom-color: #4f8cff; }
+  main { max-width: 960px; margin: 0 auto; padding: 1.5rem; }
+  .tab-panel { display: grid; gap: 1.25rem; }
+  .tab-panel[hidden] { display: none; }
   .card { background: #181c23; border: 1px solid #2a2f3a; border-radius: 12px; padding: 1.25rem 1.5rem; }
   h2 { font-size: 1rem; margin: 0 0 1rem; }
   .sub { color: #8b93a3; margin: 0; }
@@ -47,6 +55,10 @@
   a.ghost:hover { background: #232833; }
   .player-wrap { margin-top: 1rem; }
   .player-wrap video { width: 100%; max-height: 420px; border-radius: 8px; background: #000; display: block; }
+  .logs-output { margin: 1rem 0 0; padding: 0.75rem 1rem; background: #0f1115; border: 1px solid #2a2f3a;
+                 border-radius: 8px; height: 62vh; overflow-y: auto;
+                 font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                 font-size: 0.8rem; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
   .status-row { display: flex; align-items: center; gap: 1rem; }
   .status-row h2 { margin: 0; }
   .pill { padding: 0.15rem 0.7rem; border-radius: 999px; font-size: 0.8rem; font-weight: 600; }
@@ -72,37 +84,57 @@
 </head>
 <body>
 <header>
-  <h1>Online Video Archiver <span class="version">v{{ version }}</span></h1>
-  <button id="logout" class="ghost">Sign out</button>
+  <div class="header-top">
+    <h1>Online Video Archiver <span class="version">v{{ version }}</span></h1>
+    <button id="logout" class="ghost">Sign out</button>
+  </div>
+  <nav class="tabs">
+    <button class="tab active" data-tab="status">Status</button>
+    <button class="tab" data-tab="channels">Channels</button>
+    <button class="tab" data-tab="videos">Videos</button>
+    <button class="tab" data-tab="settings">Settings</button>
+    <button class="tab" data-tab="logs">Logs</button>
+  </nav>
 </header>
 
 <main>
-  <section class="card">
-    <div class="status-row">
-      <div>
-        <h2>Status</h2>
-        <p class="sub" id="status-text">Loading…</p>
+  <section class="tab-panel" id="panel-status">
+    <div class="card">
+      <div class="status-row">
+        <div>
+          <h2>Status</h2>
+          <p class="sub" id="status-text">Loading…</p>
+        </div>
+        <label class="switch" title="Start / pause the archiver">
+          <input type="checkbox" id="paused-toggle">
+          <span class="slider"></span>
+        </label>
+        <span id="paused-label" class="pill paused">…</span>
+        <button id="refresh-btn" class="ghost" title="Check all channels for new videos right now">Refresh now</button>
       </div>
-      <label class="switch" title="Start / pause the archiver">
-        <input type="checkbox" id="paused-toggle">
-        <span class="slider"></span>
-      </label>
-      <span id="paused-label" class="pill paused">…</span>
-      <button id="refresh-btn" class="ghost" title="Check all channels for new videos right now">Refresh now</button>
+      <p class="hint" id="refresh-msg"></p>
     </div>
-    <p class="hint" id="refresh-msg"></p>
+
+    <div class="card">
+      <h2>System</h2>
+      <table>
+        <thead><tr><th>Item</th><th>Value</th></tr></thead>
+        <tbody id="system-body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Storage</h2>
+      <table>
+        <thead><tr><th>Category</th><th>Size</th></tr></thead>
+        <tbody id="disk-body"></tbody>
+      </table>
+      <p class="hint" id="disk-hint"></p>
+    </div>
   </section>
 
-  <section class="card">
-    <h2>Storage</h2>
-    <table>
-      <thead><tr><th>Category</th><th>Size</th></tr></thead>
-      <tbody id="disk-body"></tbody>
-    </table>
-    <p class="hint" id="disk-hint"></p>
-  </section>
-
-  <section class="card">
+  <section class="tab-panel" id="panel-settings" hidden>
+    <div class="card">
     <h2>Settings</h2>
     <form id="settings-form">
       <div class="grid">
@@ -245,9 +277,11 @@
       </div>
     </form>
     <p class="hint" id="settings-msg"></p>
+    </div>
   </section>
 
-  <section class="card">
+  <section class="tab-panel" id="panel-channels" hidden>
+    <div class="card">
     <h2>Channels</h2>
     <form id="add-channel" class="grid">
       <div class="grow">
@@ -274,9 +308,11 @@
       <thead><tr><th>Channel</th><th>URL</th><th>Videos</th><th>Keep latest</th><th>Added</th><th></th></tr></thead>
       <tbody id="channels-body"></tbody>
     </table>
+    </div>
   </section>
 
-  <section class="card">
+  <section class="tab-panel" id="panel-videos" hidden>
+    <div class="card">
     <h2>Videos</h2>
     <form id="add-video" class="grid">
       <div class="grow">
@@ -319,6 +355,20 @@
       </thead>
       <tbody id="videos-body"></tbody>
     </table>
+    </div>
+  </section>
+
+  <section class="tab-panel" id="panel-logs" hidden>
+    <div class="card">
+      <div class="status-row">
+        <div>
+          <h2>Logs</h2>
+          <p class="sub" id="logs-status">Connecting…</p>
+        </div>
+        <button id="logs-clear-btn" class="ghost">Clear</button>
+      </div>
+      <pre id="logs-output" class="logs-output"></pre>
+    </div>
   </section>
 </main>
 
@@ -359,8 +409,43 @@ function fmtBytes(n) {
   return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + " " + units[i];
 }
 
-async function loadDisk() {
-  const d = await api("GET", "/api/disk");
+let serverStartMs = null;
+
+function fmtUptime(seconds) {
+  if (seconds === null || seconds === undefined) return "—";
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return h + "h " + m + "m";
+  if (m > 0) return m + "m " + s + "s";
+  return s + "s";
+}
+
+function renderSystem(d) {
+  const rows = [
+    ["App version", d.app_version],
+    ["yt-dlp version", d.ytdlp_version],
+    ["Uptime", null],
+  ];
+  $("#system-body").innerHTML = rows.map(([label, val]) =>
+    "<tr><td>" + label + "</td><td class='dim'" +
+    (label === "Uptime" ? ' id="uptime-cell"' : "") + ">" +
+    (val === null ? "…" : esc(val)) + "</td></tr>").join("");
+  updateUptime();
+}
+
+function updateUptime() {
+  if (serverStartMs === null) return;
+  const el = document.getElementById("uptime-cell");
+  if (!el) return;
+  el.textContent = fmtUptime(Math.max(0, Math.floor((Date.now() - serverStartMs) / 1000)));
+}
+
+async function loadStatus() {
+  const d = await api("GET", "/api/status");
+  serverStartMs = Date.now() - (d.uptime_seconds || 0) * 1000;
+  renderSystem(d);
+  renderStatus(d);
   const rows = [
     ["Active videos", d.videos_active],
     ["Orphaned folder", d.orphaned],
@@ -532,7 +617,7 @@ async function pollRefresh() {
       if (s.error) flash("refresh-msg", "Refresh failed: " + s.error, false);
       else flash("refresh-msg", "Refresh complete.");
       loadVideos();
-      loadDisk();
+      loadStatus();
       loadProxyStatus();
       return;
     }
@@ -759,13 +844,65 @@ $("#add-video").onsubmit = async (e) => {
   }
 };
 
+let logsSource = null;
+let logsAtBottom = true;
+
+function appendLog(line) {
+  const out = $("#logs-output");
+  out.textContent += line + "\n";
+  const lines = out.textContent.split("\n");
+  if (lines.length > 1000) {
+    out.textContent = lines.slice(-1000).join("\n");
+  }
+  if (logsAtBottom) out.scrollTop = out.scrollHeight;
+}
+
+function openLogs() {
+  if (logsSource) return;
+  logsSource = new EventSource("/api/logs/stream");
+  logsSource.onopen = () => {
+    $("#logs-output").textContent = "";
+    $("#logs-status").textContent = "Live — streaming logs.";
+  };
+  logsSource.onmessage = (e) => {
+    try { appendLog(JSON.parse(e.data).line); } catch (err) {}
+  };
+  logsSource.onerror = () => {
+    $("#logs-status").textContent = "Connection lost — reconnecting…";
+  };
+}
+
+$("#logs-output").addEventListener("scroll", () => {
+  const out = $("#logs-output");
+  logsAtBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+});
+
+$("#logs-clear-btn").onclick = () => { $("#logs-output").textContent = ""; };
+
+function showTab(name) {
+  document.querySelectorAll(".tab").forEach((t) =>
+    t.classList.toggle("active", t.dataset.tab === name));
+  document.querySelectorAll(".tab-panel").forEach((p) =>
+    (p.hidden = p.id !== "panel-" + name));
+  if (name === "logs") openLogs();
+  try { localStorage.setItem("ova-tab", name); } catch (e) {}
+}
+
+document.querySelectorAll(".tab").forEach((t) => {
+  t.onclick = () => showTab(t.dataset.tab);
+});
+
 (async () => {
   try {
     await loadSettings();
     await loadProxyStatus();
     await loadChannels();
     await loadVideos();
-    await loadDisk();
+    await loadStatus();
+    let initialTab = "status";
+    try { initialTab = localStorage.getItem("ova-tab") || "status"; } catch (e) {}
+    showTab(initialTab);
+    setInterval(updateUptime, 1000);
   } catch (e) {
     document.body.innerHTML = "<p style='padding:2rem'>" + esc(e.message) + "</p>";
   }

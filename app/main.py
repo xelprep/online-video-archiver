@@ -6,6 +6,7 @@ import importlib
 import json
 import logging
 import os
+import queue
 import random
 import re
 import secrets
@@ -20,12 +21,13 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.utils import make_msgid
 from pathlib import Path
 
-from flask import Flask, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, session, url_for
 from yt_dlp import YoutubeDL
 # The Python API expects an ImpersonateTarget object (not a raw string) for the
 # "impersonate" param — yt-dlp's CLI does this conversion itself, but the
@@ -33,6 +35,8 @@ from yt_dlp import YoutubeDL
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
 APP_VERSION = "1.5.0"
+# Wall-clock time the process started; used to report uptime in the UI.
+START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 VIDEO_DIR = DATA_DIR / "videos"
 DB_PATH = DATA_DIR / "archive.db"
@@ -57,6 +61,40 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("yt-archiver")
+
+# ---------------------------------------------------------------------------
+# Live log streaming for the web UI's Logs tab. A custom handler mirrors every
+# formatted record into a bounded ring buffer (recent history) and fans it out
+# to any connected Server-Sent-Events subscribers. It is attached to the root
+# logger so it sees the app, yt-dlp and request logs alike, and is gated by the
+# same level the user configures (see apply_log_level).
+# ---------------------------------------------------------------------------
+LOG_BUFFER_MAX = 500
+log_buffer = deque(maxlen=LOG_BUFFER_MAX)
+log_buffer_lock = threading.Lock()
+log_subscribers = []
+log_subscribers_lock = threading.Lock()
+
+
+class _StreamLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            line = self.format(record)
+        except Exception:
+            return
+        with log_buffer_lock:
+            log_buffer.append(line)
+        with log_subscribers_lock:
+            for q in log_subscribers:
+                try:
+                    q.put_nowait(line)
+                except queue.Full:
+                    pass
+
+
+_stream_handler = _StreamLogHandler()
+_stream_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.getLogger().addHandler(_stream_handler)
 
 
 def _env_int(name, default):
@@ -1689,9 +1727,7 @@ def api_get_settings():
     return jsonify(get_settings())
 
 
-@app.get("/api/disk")
-@require_auth
-def api_disk():
+def _disk_info():
     # Disk usage of the data volume, broken out so the UI can show how much
     # space active videos vs. the orphaned folder consume, plus free space.
     try:
@@ -1701,7 +1737,7 @@ def api_disk():
         fs_total = fs_used = fs_free = None
     videos_total = dir_size(VIDEO_DIR)
     orphaned = dir_size(VIDEO_DIR / "orphaned")
-    return jsonify({
+    return {
         "data_total": dir_size(DATA_DIR),
         "videos_total": videos_total,
         "videos_active": max(0, videos_total - orphaned),
@@ -1709,7 +1745,61 @@ def api_disk():
         "fs_total": fs_total,
         "fs_used": fs_used,
         "fs_free": fs_free,
+    }
+
+
+@app.get("/api/status")
+@require_auth
+def api_status():
+    # Everything the Status tab needs in a single call: run state, versions,
+    # uptime and storage.
+    settings = get_settings()
+    try:
+        ytdlp_version = importlib.import_module("yt_dlp.version").__version__
+    except Exception:
+        ytdlp_version = "unknown"
+    return jsonify({
+        "app_version": APP_VERSION,
+        "ytdlp_version": ytdlp_version,
+        "uptime_seconds": int(time.time() - START_TIME),
+        "paused": settings["paused"],
+        "poll_minutes": settings["poll_minutes"],
+        **_disk_info(),
     })
+
+
+@app.get("/api/logs/stream")
+@require_auth
+def api_logs_stream():
+    # Streams log lines to the Logs tab as Server-Sent Events: recent history
+    # first, then a live feed. A keepalive comment is sent every 15s so idle
+    # connections (and client disconnects) are detected promptly.
+    q = queue.Queue(maxsize=1000)
+    with log_subscribers_lock:
+        log_subscribers.append(q)
+
+    def generate():
+        try:
+            with log_buffer_lock:
+                history = list(log_buffer)
+            for line in history:
+                yield "data: " + json.dumps({"line": line}) + "\n\n"
+            while True:
+                try:
+                    line = q.get(timeout=15)
+                    yield "data: " + json.dumps({"line": line}) + "\n\n"
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+        finally:
+            with log_subscribers_lock:
+                if q in log_subscribers:
+                    log_subscribers.remove(q)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.put("/api/settings")
