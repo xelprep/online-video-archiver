@@ -314,8 +314,25 @@
       </div>
     </form>
     <p class="hint" id="channel-msg"></p>
-    <table>
-      <thead><tr><th>Channel</th><th>URL</th><th>Videos</th><th>Keep latest</th><th>Added</th><th></th></tr></thead>
+    <table id="channels-table">
+      <thead>
+        <tr>
+          <th data-key="name" data-label="Channel" class="sortable" title="Click to sort">Channel</th>
+          <th data-key="url" data-label="URL" class="sortable" title="Click to sort">URL</th>
+          <th data-key="video_count" data-label="Videos" class="sortable" title="Click to sort">Videos</th>
+          <th data-key="latest_n" data-label="Keep latest" class="sortable" title="Click to sort">Keep latest</th>
+          <th data-key="added_at" data-label="Added" class="sortable" title="Click to sort">Added</th>
+          <th></th>
+        </tr>
+        <tr class="filter-row">
+          <th><input type="text" data-filter="name" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="url" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="video_count" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="latest_n" placeholder="Filter…"></th>
+          <th><input type="text" data-filter="added_at" placeholder="Filter…"></th>
+          <th></th>
+        </tr>
+      </thead>
       <tbody id="channels-body"></tbody>
     </table>
     </div>
@@ -537,11 +554,46 @@ $("#proxy-reset-btn").onclick = async () => {
   }
 };
 
+// Shared table sort: numeric columns sort numerically, everything else sorts
+// alphabetically (locale-aware). dir is "asc" or "desc". Sorts in place.
+function sortRows(rows, key, dir) {
+  const mul = dir === "asc" ? 1 : -1;
+  rows.sort((a, b) => {
+    let av = a[key], bv = b[key];
+    if (av == null) av = "";
+    if (bv == null) bv = "";
+    if (typeof av === "number" && typeof bv === "number") {
+      return (av - bv) * mul;
+    }
+    return String(av).localeCompare(String(bv)) * mul;
+  });
+}
+
+let allChannels = [];
+let channelSort = { key: "name", dir: "asc" };
+let channelFilters = { name: "", url: "", video_count: "", latest_n: "", added_at: "" };
+
 async function loadChannels() {
-  const channels = await api("GET", "/api/channels");
+  allChannels = await api("GET", "/api/channels");
+  renderChannels();
+}
+
+function renderChannels() {
   const tbody = $("#channels-body");
+  let rows = allChannels.slice();
+
+  // Apply the per-column filters.
+  for (const [key, val] of Object.entries(channelFilters)) {
+    if (val === "" || val === undefined) continue;
+    const needle = val.toLowerCase();
+    rows = rows.filter((ch) => String(ch[key] ?? "").toLowerCase().includes(needle));
+  }
+
+  // Sort by the selected column (click a header to toggle direction).
+  sortRows(rows, channelSort.key, channelSort.dir);
+
   tbody.innerHTML = "";
-  for (const ch of channels) {
+  for (const ch of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML =
       '<td class="name-cell">' + (esc(ch.name) || '<span class="dim">unnamed</span>') + "</td>" +
@@ -555,10 +607,40 @@ async function loadChannels() {
     tr.querySelector(".delete").onclick = () => removeChannel(ch);
     tbody.appendChild(tr);
   }
-  if (!channels.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="dim">No channels yet — add one above.</td></tr>';
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="dim">' +
+      (allChannels.length ? "No channels match the filters." : "No channels yet — add one above.") + "</td></tr>";
   }
+  updateChannelSortIndicators();
 }
+
+function updateChannelSortIndicators() {
+  document.querySelectorAll("#channels-table th.sortable").forEach((th) => {
+    th.textContent = th.dataset.label +
+      (th.dataset.key === channelSort.key ? (channelSort.dir === "asc" ? " ▲" : " ▼") : "");
+  });
+}
+
+document.querySelectorAll("#channels-table th.sortable").forEach((th) => {
+  th.onclick = () => {
+    const key = th.dataset.key;
+    if (channelSort.key === key) {
+      channelSort.dir = channelSort.dir === "asc" ? "desc" : "asc";
+    } else {
+      channelSort.key = key;
+      channelSort.dir = "asc";
+    }
+    renderChannels();
+  };
+});
+
+document.querySelectorAll("#channels-table [data-filter]").forEach((el) => {
+  const evt = el.tagName === "SELECT" ? "change" : "input";
+  el.addEventListener(evt, () => {
+    channelFilters[el.dataset.filter] = el.value;
+    renderChannels();
+  });
+});
 
 function startEdit(tr, ch) {
   if (tr.classList.contains("editing")) return;
@@ -735,20 +817,7 @@ function renderVideos() {
   }
 
   // Sort by the selected column (click a header to toggle direction).
-  const { key, dir } = videoSort;
-  const mul = dir === "asc" ? 1 : -1;
-  rows.sort((a, b) => {
-    let av = a[key], bv = b[key];
-    if (key === "protected") { av = av ? 1 : 0; bv = bv ? 1 : 0; }
-    if (av == null) av = "";
-    if (bv == null) bv = "";
-    if (typeof av === "string" && typeof bv === "string") {
-      return av.localeCompare(bv) * mul;
-    }
-    if (av < bv) return -1 * mul;
-    if (av > bv) return 1 * mul;
-    return 0;
-  });
+  sortRows(rows, videoSort.key, videoSort.dir);
 
   tbody.innerHTML = "";
   for (const v of rows) {
