@@ -29,6 +29,9 @@ A small Docker service that keeps the newest N videos from each configured chann
   reactively builds a vetted pool of public SOCKS5 proxies and routes downloads
   through them until the local IP is allowed again, then drops back to direct
   egress automatically.
+- Runs a local DNS cache (dnsmasq) inside the container so the many lookups
+  yt-dlp makes for `www.youtube.com` are served from cache instead of hammering
+  the upstream resolver (set `DNS_CACHE=0` to disable).
 - Exposes a public `/health` endpoint on port 8080; everything else is behind the login.
 
 ## Quick start

@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # minimum (v22), so we install deno instead. Deno is yt-dlp's default runtime,
 # so no extra option is required in the code. (unzip is needed by the installer.)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 
@@ -20,17 +20,21 @@ RUN pip install -U --pre yt-dlp[default,curl-cffi]
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the *contents* of app/ into /app so main.py lands at /app/main.py.
+# (Also brings in entrypoint.sh and dnsmasq.conf.)
 COPY app/ ./
+RUN chmod +x /app/entrypoint.sh
 
 # Run as an unprivileged user; /data is the only writable path the app needs.
+# The container entrypoint runs as root (so it can start the dnsmasq DNS cache
+# on port 53) and then drops to appuser for the app itself — see entrypoint.sh.
+# We therefore no longer pin USER here.
 RUN useradd --create-home appuser \
     && mkdir -p /data \
     && chown appuser:appuser /data
-USER appuser
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"
 
-CMD ["python", "/app/main.py"]
+CMD ["/app/entrypoint.sh"]
