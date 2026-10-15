@@ -1154,22 +1154,26 @@ def is_restricted_error(exc):
 
 class RateLimitedError(Exception):
     # Raised when YouTube rate-limits or blocks our requests (HTTP 429,
-    # "sign in to confirm your account", etc.). Distinct from a generic
-    # download failure so the sync loop can react (backoff/abort) instead of
-    # logging a full traceback and moving on.
+    # HTTP 403, "sign in to confirm your account", etc.). Distinct from a
+    # generic download failure so the sync loop can react (backoff/abort)
+    # instead of logging a full traceback and moving on.
     pass
 
 
 def is_rate_limited_error(exc):
     # YouTube signals rate-limiting / bot-detection with specific messages.
-    # Match on stable phrases (not a bare "429", which can appear in unrelated
-    # contexts) so we can react instead of treating it as an ordinary error.
+    # Match on stable phrases (not a bare "429"/"403", which can appear in
+    # unrelated contexts) so we can react instead of treating it as an
+    # ordinary error. A 403 "Forbidden" is treated the same as a 429: it is
+    # another anti-bot signal, so it triggers the same backoff/proxy handling.
     msg = str(exc).lower()
     return any(
         phrase in msg
         for phrase in (
             "too many requests",
             "http error 429",
+            "http error 403",
+            "403 forbidden",
             "sign in to confirm",
             "request is blocked",
             "rate limit",

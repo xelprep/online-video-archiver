@@ -165,10 +165,11 @@ All of these are configurable in the **Settings** card of the web UI.
 - **TLS impersonation** — downloads go through `curl_cffi` impersonating a
   Chrome TLS/JA3 fingerprint, which is the strongest single bot signal. Can be
   switched off in Settings (in which case the User-Agent above is pinned).
-- **Rate-limit handling** — when YouTube returns a 429 / "Sign in to confirm
-  you're not a bot" response, the app either **aborts** the sync cycle (default)
-  or **backs off** for a configurable number of seconds and retries, up to a
-  small number of consecutive attempts.
+- **Rate-limit handling** — when YouTube returns a 429 / 403 / "Sign in to
+  confirm you're not a bot" response, the app either **aborts** the sync cycle
+  (default) or **backs off** for a configurable number of seconds and retries,
+  up to a small number of consecutive attempts. A 403 "Forbidden" is treated
+  the same as a 429, since it is another anti-bot signal.
 
 ### Proxy rotation (off by default)
 
