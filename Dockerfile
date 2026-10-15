@@ -14,6 +14,9 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY requirements.txt .
+
+# Explicitly install nightly yt-dlp so any addiitonal requirements can remain regular releases
+RUN pip install -U --pre yt-dlp[default,curl-cffi]
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the *contents* of app/ into /app so main.py lands at /app/main.py.

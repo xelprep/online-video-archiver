@@ -2,6 +2,7 @@ import concurrent.futures
 import contextlib
 import functools
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import shutil
 import smtplib
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -1343,8 +1345,99 @@ def sync_channel(channel_url, latest_n):
     enforce_retention(channel_url, latest_n)
 
 
+# ---------------------------------------------------------------------------
+# Keep yt-dlp current. The project tracks yt-dlp's nightly (pre-release)
+# builds, which change daily, so the build baked into the image goes stale
+# quickly. At the start of each sync cycle we ask pip for the newest --pre
+# release and reload the yt_dlp modules in this process.
+#
+# Two things make this non-trivial:
+#   * The container runs as an unprivileged user while site-packages is
+#     root-owned, so the upgrade must go to the *user* site (--user), which
+#     shadows the system install on sys.path.
+#   * A running interpreter caches imported modules in sys.modules, so
+#     `pip install --upgrade` alone would not take effect until a restart; we
+#     therefore drop the cached yt_dlp modules and re-import, then rebind the
+#     two names the app uses (YoutubeDL, ImpersonateTarget) — those are
+#     resolved as module globals at call time, so every call site picks up the
+#     new classes.
+# ---------------------------------------------------------------------------
+YTDLP_PACKAGE = "yt-dlp[default,curl-cffi]"
+PIP_UPGRADE_TIMEOUT = 180  # seconds; a slow network must not stall a cycle
+
+
+def _pip_upgrade_ytdlp():
+    # Run `pip install --user --upgrade --pre yt-dlp[...]` in a subprocess.
+    # Returns True on success. Never raises — a pip failure (e.g. no network)
+    # must not abort the sync; we simply keep using the currently installed
+    # build.
+    cmd = [
+        sys.executable, "-m", "pip", "install",
+        "--user", "--upgrade", "--pre",
+        "--no-cache-dir", "--disable-pip-version-check",
+        YTDLP_PACKAGE,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=PIP_UPGRADE_TIMEOUT,
+            text=True,
+        )
+    except Exception as exc:
+        log.warning("yt-dlp upgrade did not run: %s", exc)
+        return False
+    if proc.returncode != 0:
+        log.warning("yt-dlp upgrade failed (exit %d):\n%s",
+                    proc.returncode, (proc.stdout or "")[-2000:])
+        return False
+    log.debug("yt-dlp upgrade output:\n%s", (proc.stdout or "")[-1000:])
+    return True
+
+
+def _reload_ytdlp():
+    # Re-import yt_dlp after an upgrade so this running process uses the new
+    # build. Drop every cached yt_dlp module and re-import, then rebind the two
+    # names the app uses. (curl_cffi is left alone: it is a separate, stable
+    # dependency and its C extension should not be hot-reloaded.)
+    global YoutubeDL, ImpersonateTarget
+    for name in [m for m in sys.modules if m == "yt_dlp" or m.startswith("yt_dlp.")]:
+        del sys.modules[name]
+    yt_dlp = importlib.import_module("yt_dlp")
+    impersonate = importlib.import_module("yt_dlp.networking.impersonate")
+    version_mod = importlib.import_module("yt_dlp.version")
+    YoutubeDL = yt_dlp.YoutubeDL
+    ImpersonateTarget = impersonate.ImpersonateTarget
+    return version_mod.__version__, yt_dlp.__file__
+
+
+def ensure_latest_ytdlp():
+    # Upgrade to the newest nightly and reload it. Best-effort: any failure is
+    # logged and the cycle proceeds with the currently installed build.
+    current = "unknown"
+    try:
+        current = importlib.import_module("yt_dlp.version").__version__
+    except Exception:
+        pass
+    if not _pip_upgrade_ytdlp():
+        return
+    try:
+        version, path = _reload_ytdlp()
+    except Exception as exc:
+        log.warning("Failed to reload yt-dlp after upgrade: %s", exc)
+        return
+    if version != current:
+        log.info("yt-dlp updated: %s -> %s (loaded from %s)", current, version, path)
+    else:
+        log.debug("yt-dlp already current (%s, %s)", version, path)
+
+
 def _sync_channels():
     # Shared body of a sync cycle: process every channel with N>0.
+    # First make sure we are on the newest yt-dlp nightly (see above). This
+    # runs under the sync lock, so no other cycle can use yt_dlp mid-reload.
+    ensure_latest_ytdlp()
     for ch in load_channels():
         if ch["latest_n"] <= 0:
             # C8: channels with N=0 are skipped during the scheduled poll.
