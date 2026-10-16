@@ -1386,6 +1386,17 @@ def is_restricted_error(exc):
     return "members-only" in msg or "join this channel" in msg or "premium" in msg
 
 
+def is_age_restricted_error(exc):
+    # Age-restricted videos fail with "Sign in to confirm your age…" (plus an
+    # "This video is age-restricted" note). This is a per-video auth wall, NOT
+    # a bot block: unlike the "sign in to confirm your account" / "you're not a
+    # bot" challenges, it must not trigger rate-limit handling. Match only when
+    # the sign-in challenge mentions age so the genuine bot challenges keep
+    # their rate-limit meaning.
+    msg = str(exc).lower()
+    return "age-restricted" in msg or ("sign in to confirm" in msg and "age" in msg)
+
+
 class RateLimitedError(Exception):
     # Raised when YouTube rate-limits or blocks our requests (HTTP 429,
     # HTTP 403, "sign in to confirm your account", etc.). Distinct from a
@@ -1400,6 +1411,11 @@ def is_rate_limited_error(exc):
     # unrelated contexts) so we can react instead of treating it as an
     # ordinary error. A 403 "Forbidden" is treated the same as a 429: it is
     # another anti-bot signal, so it triggers the same backoff/proxy handling.
+    # Age-restriction challenges share the "sign in to confirm" prefix with the
+    # genuine bot challenges but are a permanent per-video auth wall, so they
+    # are excluded here and skipped by the caller instead.
+    if is_age_restricted_error(exc):
+        return False
     msg = str(exc).lower()
     return any(
         phrase in msg
@@ -1582,10 +1598,18 @@ def sync_channel(channel_url, latest_n):
                 _human_delay()
                 break
             except Exception as exc:
+                if is_age_restricted_error(exc):
+                    # Age-restricted video: a permanent per-video auth wall,
+                    # not a bot block. Skip it and move on to the next video
+                    # without touching rate-limit/proxy handling.
+                    log.warning(
+                        "Skipping %s (%s): age-restricted, requires sign-in cookies",
+                        entry["id"], entry["title"],
+                    )
+                    break
                 if is_rate_limited_error(exc):
-                    # Check rate-limiting before the restricted check: a block
-                    # signal must trigger rotation/backoff/abort, not a generic
-                    # error log.
+                    # A genuine block signal (429/403, "sign in to confirm
+                    # your account", etc.): react with rotation/backoff/abort.
                     consecutive_rate_limits += 1
                     result = _handle_rate_limit(
                         "download", channel_url, exc,
