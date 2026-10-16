@@ -112,18 +112,23 @@ five tabs:
 - **Status** — a switch that pauses/resumes all archiving (persisted; the app
   starts paused on first run), plus a **Refresh now** button that runs an immediate
   sync cycle (handy right after adding a channel, instead of waiting for the next
-  poll). Also shows the app and yt-dlp versions, current uptime, and disk usage of
-  the data volume (active videos, the orphaned folder, the data folder total, and
-  free space on the volume).
+  poll). Also shows a **Schedule** card with the configured timezone, the current
+  local time in that timezone, the scheduling mode, and the next few scheduled
+  refresh runs (or "none scheduled" while paused), alongside the app and yt-dlp
+  versions, current uptime, and disk usage of the data volume (active videos, the
+  orphaned folder, the data folder total, and free space on the volume).
 - **Channels** — add, edit, and remove channels. Each channel requires an
   explicit "keep latest N" (0 = keep only protected videos). Accepted URL
   formats: `@handle`, `https://www.youtube.com/@handle`,
   `https://www.youtube.com/channel/UC...`.
 - **Videos** — download a video by URL or ID on demand, play or download any
   archived video, and toggle per-video protection from pruning.
-- **Settings** — poll interval, log level, anti-detection options, and proxy
-  rotation (persisted in the database; see
-  [Anti-detection & proxy rotation](#anti-detection--proxy-rotation)).
+- **Settings** — a **timezone** selector (IANA zones, e.g. `America/New_York`;
+  defaults to `UTC`) that all scheduling is anchored to, plus granular refresh
+  scheduling: either **every N minutes** (interval mode) or **at set times** on
+  chosen weekdays (daily mode, e.g. `06:00, 18:00` on Mon/Tue/…), in addition to
+  log level, anti-detection options, and proxy rotation (all persisted in the
+  database; see [Anti-detection & proxy rotation](#anti-detection--proxy-rotation)).
 - **Logs** — a live, auto-scrolling stream of the app's log output (recent
   history plus new lines as they happen, over Server-Sent Events). The **Clear**
   button empties the view; the stream respects the log level set in Settings.

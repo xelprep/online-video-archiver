@@ -9,6 +9,8 @@ services:
       WEB_PASSWORD: "change-me"
       # Initial defaults only; runtime settings live in the SQLite settings table.
       POLL_MINUTES: "30"
+      # IANA timezone all refresh scheduling is anchored to (change it in the UI).
+      TIMEZONE: "UTC"
       LOG_LEVEL: "INFO"
       DATA_DIR: "/data"
     ports:

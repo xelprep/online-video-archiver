@@ -7,8 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # to decrypt YouTube signatures; the distro's node is older than yt-dlp's
 # minimum (v22), so we install deno instead. Deno is yt-dlp's default runtime,
 # so no extra option is required in the code. (unzip is needed by the installer.)
+# tzdata backs Python's zoneinfo so the app can schedule refreshes in IANA
+# timezones (without it, zoneinfo silently falls back to UTC).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 

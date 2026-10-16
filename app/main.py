@@ -23,6 +23,7 @@ import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from email.mime.text import MIMEText
 from email.utils import make_msgid
 from pathlib import Path
@@ -111,6 +112,28 @@ def _env_int(name, default):
 
 
 POLL_MINUTES_DEFAULT = max(1, _env_int("POLL_MINUTES", 30))
+# Initial default only; the settings table is the source of truth at runtime.
+TIMEZONE_DEFAULT = os.getenv("TIMEZONE", "UTC")
+
+# ---------------------------------------------------------------------------
+# Scheduling: refresh cycles run either on a fixed interval (poll_minutes, the
+# original behaviour) or at explicit wall-clock times on selected weekdays,
+# interpreted in a user-selected IANA timezone. The timezone also drives the
+# live clock and "next run" times shown on the Status tab. The schedule is
+# re-read while the worker waits, so Settings-tab edits apply without a
+# restart.
+# ---------------------------------------------------------------------------
+SCHEDULE_MODES = ("interval", "daily")
+DAY_NAMES = {"mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 7}
+# The worker waits in bounded chunks so timezone/schedule edits take effect
+# without restarting.
+SCHEDULE_TICK_SECONDS = 60
+# Sleep chunk when nothing at all is scheduled (daily mode, no days/times).
+IDLE_SCHEDULE_SLEEP = 300
+# Local wall-clock start of the most recent scheduled cycle; the interval
+# schedule anchors on it so runs stay evenly spaced. In-memory on purpose: a
+# restart re-runs immediately, matching the previous behaviour.
+last_scheduled_run = None
 
 # ---------------------------------------------------------------------------
 # Anti-detection: a consistent identity, human-like pacing, rate-limit handling
@@ -251,6 +274,13 @@ def seed_settings():
         "paused": "1",  # B5: a fresh deploy starts paused
         "poll_minutes": str(POLL_MINUTES_DEFAULT),
         "log_level": LOG_LEVEL_DEFAULT,
+        # Scheduling (see the scheduling section below). "interval" reproduces
+        # the original every-N-minutes behaviour; "daily" runs at explicit
+        # wall-clock times on selected weekdays, in the chosen timezone.
+        "timezone": TIMEZONE_DEFAULT,
+        "schedule_mode": "interval",
+        "schedule_days": "mon,tue,wed,thu,fri,sat,sun",
+        "schedule_times": "06:00,18:00",
         # Log-viewer toggles (see apply_http_log_setting / apply_ydl_log_setting).
         "http_logs": "1",
         "ydl_verbose": "0",
@@ -278,6 +308,164 @@ def seed_settings():
 
 def is_paused():
     return get_setting("paused", "1") == "1"
+
+
+# ---------------------------------------------------------------------------
+# Timezone + schedule parsing. All schedule values are read fresh on every use
+# so edits made from the Settings tab take effect without a restart.
+# ---------------------------------------------------------------------------
+def resolve_timezone():
+    # The configured IANA timezone as a ZoneInfo. Falls back to UTC (with a
+    # warning) if the name is invalid or the tzdata tables are missing, so a
+    # bad setting can never crash the app or the sync worker.
+    name = (get_setting("timezone", TIMEZONE_DEFAULT) or "").strip()
+    if not name:
+        name = TIMEZONE_DEFAULT
+    try:
+        return ZoneInfo(name)
+    except (OSError, ValueError, KeyError, TypeError):
+        log.warning("Invalid timezone %r; falling back to UTC", name)
+        return timezone.utc
+
+
+def is_valid_timezone(name):
+    try:
+        ZoneInfo((name or "").strip())
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    return True
+
+
+def parse_schedule_days(value):
+    # "mon,tue" -> {1, 2} (ISO weekdays, 1 = Monday). Empty/blank means no
+    # days selected, i.e. nothing is scheduled in daily mode.
+    days = set()
+    for token in re.split(r"[,\s;]+", (value or "").strip()):
+        if not token:
+            continue
+        key = token[:3].lower()
+        if key in DAY_NAMES:
+            days.add(DAY_NAMES[key])
+        else:
+            try:
+                n = int(token)
+            except ValueError:
+                continue
+            if 1 <= n <= 7:
+                days.add(n)
+    return days
+
+
+def parse_schedule_times(value):
+    # "07:30, 19" -> [(7, 30), (19, 0)] sorted. Minutes default to 0; values
+    # outside 0-23 / 0-59 are dropped.
+    times = []
+    for token in re.split(r"[,\s;]+", (value or "").strip()):
+        if not token:
+            continue
+        m = re.match(r"^(\d{1,2})(?::(\d{1,2}))?$", token)
+        if not m:
+            continue
+        hour = int(m.group(1))
+        minute = int(m.group(2)) if m.group(2) is not None else 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            times.append((hour, minute))
+    return sorted(set(times))
+
+
+def get_schedule(tz=None):
+    # Everything the Status tab needs about *when* refreshes run, resolved in
+    # the configured timezone.
+    if tz is None:
+        tz = resolve_timezone()
+    mode = (get_setting("schedule_mode", "interval") or "interval").lower()
+    if mode not in SCHEDULE_MODES:
+        mode = "interval"
+    try:
+        poll_minutes = max(1, int(get_setting("poll_minutes", str(POLL_MINUTES_DEFAULT))))
+    except (TypeError, ValueError):
+        poll_minutes = POLL_MINUTES_DEFAULT
+    days = parse_schedule_days(get_setting("schedule_days", "mon,tue,wed,thu,fri,sat,sun"))
+    times = parse_schedule_times(get_setting("schedule_times", "06:00,18:00"))
+    return {
+        "mode": mode,
+        "poll_minutes": poll_minutes,
+        "days": sorted(days),
+        "times": times,
+    }
+
+
+def upcoming_runs(schedule, tz, now_local, count=4):
+    # The next `count` wall-clock times a scheduled cycle will start, in the
+    # configured timezone. Returns [] when paused or when daily mode has no
+    # days/times selected.
+    if is_paused():
+        return []
+    if schedule["mode"] == "interval":
+        step = timedelta(minutes=schedule["poll_minutes"])
+        anchor = last_scheduled_run
+        if anchor is None:
+            anchor = datetime.now(tz)
+        runs = []
+        cursor = anchor + step
+        while len(runs) < count:
+            runs.append(cursor)
+            cursor = cursor + step
+        return runs
+
+    if not schedule["days"] or not schedule["times"]:
+        return []
+    runs = []
+    # Scan the next 8 weeks of (day, time) slots so we can always fill `count`
+    # even when only one weekday and one time are selected. Candidates are
+    # built from the local *calendar date* + wall-clock time (not by adding
+    # 24-hour increments to a tz-aware datetime), so a run stays at the same
+    # wall-clock time across a DST change.
+    base_date = now_local.date()
+    for day_offset in range(0, 56):
+        date = base_date + timedelta(days=day_offset)
+        if date.isoweekday() not in schedule["days"]:
+            continue
+        for (hour, minute) in schedule["times"]:
+            candidate = datetime(date.year, date.month, date.day, hour, minute,
+                                 tzinfo=tz)
+            if candidate > now_local:
+                runs.append(candidate)
+        if len(runs) >= count:
+            break
+    runs.sort()
+    return runs[:count]
+
+
+def describe_schedule(schedule, tz):
+    # Human-readable summary of the schedule for the Status tab.
+    if is_paused():
+        return "Paused — no refreshes will run until you flip the switch."
+    if schedule["mode"] == "interval":
+        return f"Running — refreshing every {schedule['poll_minutes']} min."
+    if not schedule["days"] or not schedule["times"]:
+        return "Running — no run times selected, so nothing is scheduled."
+    day_labels = {v: k.capitalize() for k, v in DAY_NAMES.items()}
+    all_days = {1, 2, 3, 4, 5, 6, 7}
+    if set(schedule["days"]) == all_days:
+        day_text = "every day"
+    elif set(schedule["days"]) == {1, 2, 3, 4, 5}:
+        day_text = "weekdays"
+    elif set(schedule["days"]) == {6, 7}:
+        day_text = "weekends"
+    else:
+        day_text = ", ".join(day_labels[d] for d in schedule["days"])
+    time_text = ", ".join(f"{h:02d}:{m:02d}" for (h, m) in schedule["times"])
+    return f"Running — {time_text} ({day_text}), in {tz_name(tz)}."
+
+
+def fmt_local(dt, tz):
+    # Compact wall-clock stamp for display, e.g. "2026-10-15 06:00 -0400".
+    return dt.strftime("%Y-%m-%d %H:%M ") + dt.strftime("%z")[:3] + ":" + dt.strftime("%z")[3:]
+
+
+def tz_name(tz):
+    return getattr(tz, "name", None) or str(tz)
 
 
 def apply_log_level():
@@ -524,6 +712,14 @@ def get_settings():
         "http_logs": get_setting("http_logs", "1") == "1",
         "ydl_verbose": get_setting("ydl_verbose", "0") == "1",
         "paused": is_paused(),
+        # Scheduling (see the scheduling section above).
+        "timezone": (get_setting("timezone", TIMEZONE_DEFAULT) or "").strip() or TIMEZONE_DEFAULT,
+        "schedule_mode": (get_setting("schedule_mode", "interval") or "interval").lower(),
+        "schedule_days": get_setting("schedule_days", "") or "",
+        "schedule_times": get_setting("schedule_times", "") or "",
+        # Derived so the UI can re-render the Status card right after a
+        # settings save (PUT responses return this payload).
+        "schedule_summary": describe_schedule(get_schedule(), resolve_timezone()),
         "smtp_host": get_setting("smtp_host", ""),
         "smtp_port": smtp_port,
         "smtp_encryption": get_setting("smtp_encryption", "starttls"),
@@ -1555,27 +1751,62 @@ def sync_all_blocking():
         _sync_channels()
 
 
+def _seconds_until_next_run(schedule, tz):
+    # Seconds until the next scheduled cycle should start. None means nothing
+    # is scheduled (daily mode with no days or times selected). Interval mode
+    # anchors on the start of the previous scheduled run so runs stay evenly
+    # spaced; the first cycle after startup runs immediately (matching the
+    # original behaviour), and a sync that took longer than the interval still
+    # gets the small 5 s floor so it cannot hammer in a tight loop.
+    global last_scheduled_run
+    if schedule["mode"] == "interval":
+        if last_scheduled_run is None:
+            return 0.0
+        wait = schedule["poll_minutes"] * 60 - (time.time() - last_scheduled_run.timestamp())
+        return max(5.0, wait) if wait < 0 else wait
+    runs = upcoming_runs(schedule, tz, datetime.now(tz), count=1)
+    if not runs:
+        return None
+    return max(0.0, (runs[0] - datetime.now(tz)).total_seconds())
+
+
 def worker():
+    # The sync worker is schedule-driven: it re-reads the timezone and schedule
+    # settings on every loop iteration and waits in bounded chunks, so edits
+    # made on the Settings tab (pause switch, interval, mode, days, times,
+    # timezone) take effect without restarting the app.
     while True:
-        paused = is_paused()
         apply_log_level()
         apply_http_log_setting()
         apply_ydl_log_setting()
+        if is_paused():
+            # Re-check the flag frequently so an unpause takes effect quickly.
+            time.sleep(PAUSE_POLL_SECONDS)
+            continue
+        schedule = get_schedule()
+        tz = resolve_timezone()
+        wait = _seconds_until_next_run(schedule, tz)
+        if wait is None:
+            # Daily mode with nothing selected: idle, but keep re-reading
+            # settings so a later selection takes effect promptly.
+            time.sleep(IDLE_SCHEDULE_SLEEP)
+            continue
+        if wait > 0:
+            # Sleep at most one chunk; the loop then recomputes the wait with
+            # fresh settings, so schedule/timezone edits apply mid-wait.
+            time.sleep(min(wait, SCHEDULE_TICK_SECONDS))
+            continue
+        # Anchor the interval schedule on the *start* of the cycle so runs stay
+        # evenly spaced even when a sync takes longer than the interval.
+        global last_scheduled_run
+        last_scheduled_run = datetime.now(tz)
         started = time.monotonic()
         try:
             sync_all()
         except Exception as exc:
             report_error("Sync cycle failed", exc)
         elapsed = time.monotonic() - started
-        if paused:
-            # Re-check the flag frequently so an unpause takes effect quickly.
-            time.sleep(PAUSE_POLL_SECONDS)
-            continue
-        try:
-            poll_minutes = max(1, int(get_setting("poll_minutes", "30")))
-        except (TypeError, ValueError):
-            poll_minutes = POLL_MINUTES_DEFAULT
-        time.sleep(max(5, poll_minutes * 60 - elapsed))
+        log.info("Scheduled sync cycle finished in %.0fs", elapsed)
 
 
 # ---------------------------------------------------------------------------
@@ -1771,6 +2002,29 @@ def api_get_settings():
     return jsonify(get_settings())
 
 
+@app.get("/api/timezones")
+@require_auth
+def api_timezones():
+    # Curated list of common IANA zones for the Settings-tab selector, grouped
+    # by region. The UI offers these as options; the backend accepts any valid
+    # IANA name, so an exotic zone can still be set via the API.
+    zones = [
+        "UTC",
+        "US/Eastern", "US/Central", "US/Mountain", "US/Pacific", "America/Anchorage", "Pacific/Honolulu",
+        "America/New_York", "America/Chicago", "America/Denver", "America/Los_Angeles", "America/Phoenix",
+        "America/Toronto", "America/Vancouver", "America/Mexico_City", "America/Sao_Paulo", "America/Argentina/Buenos_Aires",
+        "Europe/London", "Europe/Dublin", "Europe/Lisbon", "Europe/Madrid", "Europe/Paris", "Europe/Berlin",
+        "Europe/Amsterdam", "Europe/Rome", "Europe/Stockholm", "Europe/Warsaw", "Europe/Athens", "Europe/Istanbul",
+        "Europe/Moscow", "Europe/Kyiv",
+        "Asia/Kolkata", "Asia/Dhaka", "Asia/Bangkok", "Asia/Jakarta", "Asia/Shanghai", "Asia/Hong_Kong",
+        "Asia/Tokyo", "Asia/Seoul", "Asia/Singapore", "Asia/Dubai", "Asia/Tehran", "Asia/Kabul",
+        "Australia/Sydney", "Australia/Melbourne", "Australia/Brisbane", "Australia/Adelaide", "Australia/Perth",
+        "Pacific/Auckland", "Pacific/Fiji",
+    ]
+    valid = [z for z in zones if is_valid_timezone(z)]
+    return jsonify({"timezones": valid})
+
+
 def _disk_info():
     # Disk usage of the data volume, broken out so the UI can show how much
     # space active videos vs. the orphaned folder consume, plus free space.
@@ -1792,11 +2046,35 @@ def _disk_info():
     }
 
 
+def schedule_payload():
+    # The schedule block shared by /api/status and /api/schedule (the latter is
+    # polled by the UI on a timer, so it must stay cheap — no disk walk).
+    tz = resolve_timezone()
+    schedule = get_schedule(tz)
+    now_local = datetime.now(tz)
+    runs = upcoming_runs(schedule, tz, now_local)
+    return {
+        "timezone": tz_name(tz),
+        "local_time": fmt_local(now_local, tz),
+        "local_time_iso": now_local.isoformat(),
+        "schedule_mode": schedule["mode"],
+        "schedule_days": schedule["days"],
+        "schedule_times": schedule["times"],
+        "schedule_summary": describe_schedule(schedule, tz),
+        "next_runs": [fmt_local(r, tz) for r in runs],
+        "next_run_iso": [r.isoformat() for r in runs],
+        "last_scheduled_run": (fmt_local(last_scheduled_run, tz)
+                               if last_scheduled_run else None),
+        "paused": is_paused(),
+    }
+
+
 @app.get("/api/status")
 @require_auth
 def api_status():
     # Everything the Status tab needs in a single call: run state, versions,
-    # uptime and storage.
+    # uptime, storage, and the schedule (current local time + upcoming runs,
+    # resolved in the configured timezone).
     settings = get_settings()
     try:
         ytdlp_version = importlib.import_module("yt_dlp.version").__version__
@@ -1808,8 +2086,18 @@ def api_status():
         "uptime_seconds": int(time.time() - START_TIME),
         "paused": settings["paused"],
         "poll_minutes": settings["poll_minutes"],
+        "schedule_summary": settings.get("schedule_summary"),
+        **schedule_payload(),
         **_disk_info(),
     })
+
+
+@app.get("/api/schedule")
+@require_auth
+def api_schedule():
+    # Schedule-only view: the UI polls this on a timer to keep the Schedule
+    # card (next-run times) fresh without re-walking the data directory.
+    return jsonify(schedule_payload())
 
 
 @app.get("/api/logs/stream")
@@ -1863,6 +2151,30 @@ def api_update_settings():
             errors["poll_minutes"] = "must be between 1 and 1440"
         if pm is not None:
             set_setting("poll_minutes", pm)
+    # Scheduling (see the scheduling section above).
+    if "timezone" in data:
+        tz_name_value = str(data["timezone"] or "").strip()
+        if not is_valid_timezone(tz_name_value):
+            errors["timezone"] = ("must be a valid IANA timezone name "
+                                  "(e.g. America/New_York, Europe/London, UTC)")
+        else:
+            set_setting("timezone", tz_name_value)
+    if "schedule_mode" in data:
+        mode = str(data["schedule_mode"] or "").strip().lower()
+        if mode not in SCHEDULE_MODES:
+            errors["schedule_mode"] = "must be one of: " + ", ".join(SCHEDULE_MODES)
+        else:
+            set_setting("schedule_mode", mode)
+    if "schedule_days" in data:
+        days = parse_schedule_days(data["schedule_days"])
+        # Empty is allowed: in daily mode it simply means "nothing scheduled"
+        # (the Status tab says so); in interval mode days are ignored.
+        set_setting("schedule_days",
+                    ",".join(k for k, v in DAY_NAMES.items() if v in days))
+    if "schedule_times" in data:
+        times = parse_schedule_times(data["schedule_times"])
+        set_setting("schedule_times",
+                    ",".join(f"{h:02d}:{m:02d}" for (h, m) in times))
     if "log_level" in data:
         level = str(data["log_level"]).upper()
         if level not in VALID_LOG_LEVELS:

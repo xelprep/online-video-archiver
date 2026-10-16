@@ -124,6 +124,15 @@
     </div>
 
     <div class="card">
+      <h2>Schedule</h2>
+      <table>
+        <thead><tr><th>Item</th><th>Value</th></tr></thead>
+        <tbody id="schedule-body"></tbody>
+      </table>
+      <p class="hint" id="schedule-hint"></p>
+    </div>
+
+    <div class="card">
       <h2>Storage</h2>
       <table>
         <thead><tr><th>Category</th><th>Size</th></tr></thead>
@@ -138,10 +147,6 @@
     <h2>Settings</h2>
     <form id="settings-form">
       <div class="grid">
-        <div>
-          <label for="poll_minutes">Poll interval (minutes)</label>
-          <input type="number" id="poll_minutes" name="poll_minutes" min="1" max="1440" required>
-        </div>
         <div>
           <label for="log_level">Log level</label>
           <select id="log_level" name="log_level">
@@ -160,6 +165,61 @@
           <span class="hint">On reveals yt-dlp status and download progress (very chatty).</span>
         </div>
       </div>
+
+      <h3 class="subhead">Scheduling</h3>
+      <p class="hint">When refresh cycles run. <b>Every N minutes</b> keeps the simple
+      interval behaviour; <b>at set times</b> runs once per selected weekday at each
+      listed wall-clock time. All times are interpreted in the <b>timezone</b> below,
+      which also drives the clock shown on the Status tab.</p>
+      <div class="grid">
+        <div class="grow">
+          <label for="timezone">Timezone</label>
+          <select id="timezone" name="timezone"></select>
+          <span class="hint">IANA zone (e.g. America/New_York). The Status tab shows the
+          current time in this zone.</span>
+        </div>
+        <div>
+          <label for="schedule_mode">Run refreshes</label>
+          <select id="schedule_mode" name="schedule_mode">
+            <option value="interval">Every N minutes</option>
+            <option value="daily">At set times / days</option>
+          </select>
+        </div>
+        <div>
+          <label for="poll_minutes">Interval (minutes)</label>
+          <input type="number" id="poll_minutes" name="poll_minutes" min="1" max="1440">
+          <span class="hint">Used when "Every N minutes" is selected.</span>
+        </div>
+        <div class="grow">
+          <label for="schedule_times">Run times (HH:MM, comma-separated)</label>
+          <input type="text" id="schedule_times" name="schedule_times" placeholder="06:00, 18:00" spellcheck="false">
+          <span class="hint">Used when "At set times / days" is selected. 24-hour clock.</span>
+        </div>
+      </div>
+      <div class="grid">
+        <div>
+          <label><input type="checkbox" id="day_mon" data-day="mon"> Mon</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_tue" data-day="tue"> Tue</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_wed" data-day="wed"> Wed</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_thu" data-day="thu"> Thu</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_fri" data-day="fri"> Fri</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_sat" data-day="sat"> Sat</label>
+        </div>
+        <div>
+          <label><input type="checkbox" id="day_sun" data-day="sun"> Sun</label>
+        </div>
+      </div>
+      <p class="hint" id="schedule-days-hint">Days apply when "At set times / days" is selected.</p>
 
       <h3 class="subhead">Anti-detection &amp; rate limiting</h3>
       <p class="hint">Makes downloads look like a normal human browser: a consistent
@@ -473,6 +533,7 @@ async function loadStatus() {
   serverStartMs = Date.now() - (d.uptime_seconds || 0) * 1000;
   renderSystem(d);
   renderStatus(d);
+  renderSchedule(d);
   const rows = [
     ["Active videos", d.videos_active],
     ["Orphaned folder", d.orphaned],
@@ -486,12 +547,34 @@ async function loadStatus() {
 }
 
 function renderStatus(s) {
-  $("#status-text").textContent = s.paused
-    ? "Paused — no downloads will run until you flip the switch."
-    : "Running — checking channels every " + s.poll_minutes + " min.";
+  $("#status-text").textContent = s.schedule_summary
+    || (s.paused
+      ? "Paused — no downloads will run until you flip the switch."
+      : "Running — checking channels every " + s.poll_minutes + " min.");
   const label = $("#paused-label");
   label.textContent = s.paused ? "Paused" : "Running";
   label.className = "pill " + (s.paused ? "paused" : "running");
+}
+
+// The Schedule card: live local clock (in the configured timezone), the
+// schedule summary, the last scheduled run, and the upcoming run times.
+function renderSchedule(d) {
+  const runs = (d.next_runs || []).map((r) => r.slice(0, 16));
+  const rows = [
+    ["Timezone", d.timezone],
+    ["Local time", d.local_time ? d.local_time.slice(0, 16) : "…"],
+    ["Mode", d.schedule_mode === "daily" ? "At set times / days" : "Every N minutes"],
+    ["Next runs", runs.length ? runs.join(" · ") : "none scheduled"],
+    ["Last scheduled run", d.last_scheduled_run ? d.last_scheduled_run.slice(0, 16) : "not yet"],
+  ];
+  $("#schedule-body").innerHTML = rows.map(([label, val]) =>
+    "<tr><td>" + label + "</td><td class='dim'>" + esc(val) + "</td></tr>").join("");
+  $("#schedule-hint").textContent = d.schedule_summary || "";
+}
+
+async function loadSchedule() {
+  const d = await api("GET", "/api/schedule");
+  renderSchedule(d);
 }
 
 async function loadSettings() {
@@ -502,6 +585,10 @@ async function loadSettings() {
   $("#log_level").value = s.log_level;
   $("#http_logs").checked = !!s.http_logs;
   $("#ydl_verbose").checked = !!s.ydl_verbose;
+  $("#schedule_mode").value = s.schedule_mode || "interval";
+  $("#schedule_times").value = formatScheduleTimes(s.schedule_times);
+  syncDayCheckboxes(s.schedule_days);
+  $("#timezone").value = s.timezone || "UTC";
   $("#tls_impersonate").value = s.tls_impersonate || "chrome";
   $("#user_agent").value = s.user_agent || "";
   $("#download_delay_min").value = s.download_delay_min ?? "";
@@ -687,6 +774,65 @@ $("#paused-toggle").onchange = async (e) => {
   }
 };
 
+// Toggling a day checkbox saves the schedule right away, mirroring the paused
+// toggle, so the schedule card on the status page reflects it without a form
+// submit.
+for (const cb of document.querySelectorAll("[data-day]")) {
+  cb.onchange = async (e) => {
+    try {
+      const s = await api("PUT", "/api/settings", { schedule_days: daysFromCheckboxes() });
+      renderStatus(s);
+      await loadSchedule();
+    } catch (err) {
+      e.target.checked = !e.target.checked;
+      flash("settings-msg", err.message, false);
+    }
+  };
+}
+
+// Turn a raw "mon,tue" string back into the checkbox states.
+function syncDayCheckboxes(daysCsv) {
+  const set = new Set((daysCsv || "").split(",").map((x) => x.trim().toLowerCase()));
+  for (const cb of document.querySelectorAll("[data-day]")) {
+    cb.checked = set.has(cb.dataset.day);
+  }
+}
+
+// Read the currently-checked day boxes back into a canonical csv in fixed order.
+function daysFromCheckboxes() {
+  return [...document.querySelectorAll("[data-day]")]
+    .filter((cb) => cb.checked)
+    .map((cb) => cb.dataset.day)
+    .join(",");
+}
+
+// "06:00,18:00" -> "06:00, 18:00" for display in the settings field.
+function formatScheduleTimes(timesCsv) {
+  const parts = [];
+  for (const raw of (timesCsv || "").split(",")) {
+    const t = raw.trim();
+    if (!t) continue;
+    const [h, m] = (t + ":0").split(":").slice(0, 2);
+    parts.push(String(h).padStart(2, "0") + ":" + String(m || "0").padStart(2, "0"));
+  }
+  return parts.join(", ");
+}
+
+// Populate the timezone <select> from the curated list the server exposes.
+async function populateTimezones() {
+  const sel = $("#timezone");
+  const t = await api("GET", "/api/timezones");
+  const names = t.timezones || [];
+  sel.innerHTML = "";
+  for (const name of names) {
+    const opt = document.createElement("option");
+    opt.value = name;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  }
+  if (!names.includes(sel.value)) sel.value = names.includes("UTC") ? "UTC" : (names[0] || "");
+}
+
 async function doRefresh() {
   const btn = $("#refresh-btn");
   btn.disabled = true;
@@ -724,6 +870,10 @@ $("#refresh-btn").onclick = doRefresh;
 async function saveSettings() {
   return api("PUT", "/api/settings", {
     poll_minutes: parseInt($("#poll_minutes").value, 10),
+    timezone: $("#timezone").value,
+    schedule_mode: $("#schedule_mode").value,
+    schedule_times: $("#schedule_times").value,
+    schedule_days: daysFromCheckboxes(),
     log_level: $("#log_level").value,
     http_logs: $("#http_logs").checked,
     ydl_verbose: $("#ydl_verbose").checked,
@@ -977,15 +1127,18 @@ document.querySelectorAll(".tab").forEach((t) => {
 
 (async () => {
   try {
+    await populateTimezones();
     await loadSettings();
     await loadProxyStatus();
     await loadChannels();
     await loadVideos();
     await loadStatus();
+    await loadSchedule();
     let initialTab = "status";
     try { initialTab = localStorage.getItem("ova-tab") || "status"; } catch (e) {}
     showTab(initialTab);
     setInterval(updateUptime, 1000);
+    setInterval(loadSchedule, 30000);
   } catch (e) {
     document.body.innerHTML = "<p style='padding:2rem'>" + esc(e.message) + "</p>";
   }
