@@ -213,8 +213,9 @@ back to its own IP immediately.
   at 8080.
 - The container runs as an unprivileged user (UID 1000). On Linux hosts, make sure
   `./data` is writable by that UID (e.g. `chown -R 1000:1000 data`).
-- YouTube may change or restrict available formats. yt-dlp is pinned to a specific
-  release in `requirements.txt`; bump the pin periodically.
+- YouTube may change or restrict available formats. yt-dlp is installed as a nightly
+  (pre-release) build in the image, and the app self-upgrades to the newest nightly at
+  the start of every refresh run, so it stays current without manual bumps.
 - Some videos can be age-restricted, members-only, region-restricted, or otherwise unavailable without browser cookies. This base version intentionally does not embed account cookies.
 - The filename is sanitized for common filesystem-invalid characters, and the YouTube
   video ID is appended, so sanitized-name collisions cannot cause overwrites. The SQLite

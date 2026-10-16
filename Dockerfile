@@ -30,9 +30,18 @@ RUN chmod +x /app/entrypoint.sh
 # The container entrypoint runs as root (so it can start the dnsmasq DNS cache
 # on port 53) and then drops to appuser for the app itself — see entrypoint.sh.
 # We therefore no longer pin USER here.
+#
+# The app self-upgrades yt-dlp to the newest nightly at the start of each sync
+# cycle via `pip install --user`. The default user-site base is HOME/.local,
+# which is not writable by appuser (HOME is /root's or unset), so pip fails with
+# "Permission denied: '/root/.local/lib/python3.13/site-packages'". We pin the
+# base to a dedicated appuser-owned directory and export PYTHONUSERBASE so both
+# the pip subprocess and the interpreter's sys.path agree on where it lives.
 RUN useradd --create-home appuser \
-    && mkdir -p /data \
-    && chown appuser:appuser /data
+    && mkdir -p /data /app/.ytdlp-userbase \
+    && chown appuser:appuser /data /app/.ytdlp-userbase
+
+ENV PYTHONUSERBASE=/app/.ytdlp-userbase
 
 EXPOSE 8080
 

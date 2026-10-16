@@ -1630,7 +1630,14 @@ def sync_channel(channel_url, latest_n):
 # Two things make this non-trivial:
 #   * The container runs as an unprivileged user while site-packages is
 #     root-owned, so the upgrade must go to the *user* site (--user), which
-#     shadows the system install on sys.path.
+#     shadows the system install on sys.path. The user site lives under
+#     PYTHONUSERBASE (default: HOME/.local), which is not guaranteed to be
+#     writable by the app user — pip then fails with
+#     "Permission denied: '/root/.local/lib/python3.13/site-packages'". We
+#     therefore pin the base to a dedicated appuser-owned directory in the
+#     image via PYTHONUSERBASE, set both here (for the pip subprocess) and in
+#     the Dockerfile (so the interpreter's sys.path entry matches what pip
+#     writes).
 #   * A running interpreter caches imported modules in sys.modules, so
 #     `pip install --upgrade` alone would not take effect until a restart; we
 #     therefore drop the cached yt_dlp modules and re-import, then rebind the
@@ -1640,6 +1647,31 @@ def sync_channel(channel_url, latest_n):
 # ---------------------------------------------------------------------------
 YTDLP_PACKAGE = "yt-dlp[default,curl-cffi]"
 PIP_UPGRADE_TIMEOUT = 180  # seconds; a slow network must not stall a cycle
+# Where the --user install goes. Must stay in sync with the Dockerfile's
+# PYTHONUSERBASE ENV (see above); override only via the env var. The image
+# creates this directory and chowns it to appuser so pip can populate it.
+YTDLP_USER_BASE = Path(os.getenv("YTDLP_USER_BASE", "/app/.ytdlp-userbase"))
+
+
+def _user_site_dir():
+    # The site-packages dir pip --user writes into. We ask the interpreter
+    # itself (with the same PYTHONUSERBASE pip sees) rather than deriving the
+    # path via sysconfig, whose scheme differs across platforms — this is
+    # exactly the directory pip installs into, so the re-import finds the new
+    # copy. site.py only adds this dir to sys.path if it already existed at
+    # interpreter startup, so on the first upgrade after container start it is
+    # absent and _reload_ytdlp() must insert it explicitly.
+    env = dict(os.environ, PYTHONUSERBASE=str(YTDLP_USER_BASE))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "site", "--user-site"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=15, text=True,
+        )
+    except Exception:
+        return None
+    path = (proc.stdout or "").strip()
+    return Path(path) if path else None
 
 
 def _pip_upgrade_ytdlp():
@@ -1653,9 +1685,13 @@ def _pip_upgrade_ytdlp():
         "--no-cache-dir", "--disable-pip-version-check",
         YTDLP_PACKAGE,
     ]
+    # PYTHONUSERBASE decides where --user lands; keep it on the writable data
+    # volume rather than whatever HOME happens to be (see comment above).
+    env = dict(os.environ, PYTHONUSERBASE=str(YTDLP_USER_BASE))
     try:
         proc = subprocess.run(
             cmd,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=PIP_UPGRADE_TIMEOUT,
@@ -1678,6 +1714,14 @@ def _reload_ytdlp():
     # names the app uses. (curl_cffi is left alone: it is a separate, stable
     # dependency and its C extension should not be hot-reloaded.)
     global YoutubeDL, ImpersonateTarget
+    # Make sure the user-site dir pip just installed into is on sys.path *ahead*
+    # of the system site-packages. site.py only adds it at interpreter startup
+    # when the dir already exists, so on the first upgrade after container start
+    # it is missing and the re-import below would otherwise resolve to the stale
+    # system copy.
+    user_site = _user_site_dir()
+    if user_site and user_site.is_dir() and str(user_site) not in sys.path:
+        sys.path.insert(0, str(user_site))
     for name in [m for m in sys.modules if m == "yt_dlp" or m.startswith("yt_dlp.")]:
         del sys.modules[name]
     yt_dlp = importlib.import_module("yt_dlp")
