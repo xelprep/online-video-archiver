@@ -687,13 +687,13 @@ def get_settings():
     except (TypeError, ValueError):
         smtp_port = 587
     try:
-        download_delay_min = int(get_setting("download_delay_min", "5"))
+        download_delay_min = max(0.0, float(get_setting("download_delay_min", "5")))
     except (TypeError, ValueError):
-        download_delay_min = 5
+        download_delay_min = 5.0
     try:
-        download_delay_max = int(get_setting("download_delay_max", "20"))
+        download_delay_max = max(0.0, float(get_setting("download_delay_max", "20")))
     except (TypeError, ValueError):
-        download_delay_max = 20
+        download_delay_max = 20.0
     try:
         rate_limit_backoff_seconds = int(get_setting("rate_limit_backoff_seconds", "600"))
     except (TypeError, ValueError):
@@ -1540,17 +1540,21 @@ def _handle_rate_limit(context, channel_url, exc, consecutive=1):
 def _human_delay():
     # Sleep a random interval between the configured min and max to mimic the
     # irregular cadence of a human, rather than a tight bot loop. Read per call
-    # so a settings change applies without a restart.
+    # so a settings change applies without a restart. Min/max are fractional
+    # seconds (millisecond precision): whole-second delays are themselves a
+    # bot signal, so we keep sub-second resolution and round the drawn delay to
+    # milliseconds — a human pause is ~1.347s, never an exact integer or a
+    # 17-digit double.
     try:
-        lo = max(0, int(get_setting("download_delay_min", "5")))
-        hi = max(0, int(get_setting("download_delay_max", "20")))
+        lo = max(0.0, float(get_setting("download_delay_min", "5")))
+        hi = max(0.0, float(get_setting("download_delay_max", "20")))
     except (TypeError, ValueError):
-        lo, hi = 5, 20
+        lo, hi = 5.0, 20.0
     if hi < lo:
         lo, hi = hi, lo
-    delay = random.uniform(lo, hi)
+    delay = round(random.uniform(lo, hi), 3)
     if delay > 0:
-        log.debug("Human-like delay: sleeping %.1fs", delay)
+        log.debug("Human-like delay: sleeping %.3fs", delay)
         time.sleep(delay)
 
 
@@ -2382,26 +2386,26 @@ def api_update_settings():
             set_setting("user_agent", ua)
     if "download_delay_min" in data:
         try:
-            dmin = int(data["download_delay_min"])
+            dmin = float(data["download_delay_min"])
         except (TypeError, ValueError):
             dmin = None
-            errors["download_delay_min"] = "must be an integer"
+            errors["download_delay_min"] = "must be a number of seconds (ms precision)"
         if dmin is not None and dmin < 0:
             dmin = None
             errors["download_delay_min"] = "must be >= 0"
         if dmin is not None:
-            set_setting("download_delay_min", dmin)
+            set_setting("download_delay_min", round(dmin, 3))
     if "download_delay_max" in data:
         try:
-            dmax = int(data["download_delay_max"])
+            dmax = float(data["download_delay_max"])
         except (TypeError, ValueError):
             dmax = None
-            errors["download_delay_max"] = "must be an integer"
+            errors["download_delay_max"] = "must be a number of seconds (ms precision)"
         if dmax is not None and dmax < 0:
             dmax = None
             errors["download_delay_max"] = "must be >= 0"
         if dmax is not None:
-            set_setting("download_delay_max", dmax)
+            set_setting("download_delay_max", round(dmax, 3))
     if "rate_limit_action" in data:
         action = str(data["rate_limit_action"]).lower()
         if action not in RATE_LIMIT_ACTIONS:

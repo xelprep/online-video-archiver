@@ -252,11 +252,13 @@
         </div>
         <div>
           <label for="download_delay_min">Pause between downloads, min (s)</label>
-          <input type="number" id="download_delay_min" name="download_delay_min" min="0" step="1">
+          <input type="number" id="download_delay_min" name="download_delay_min" min="0" step="0.001">
         </div>
         <div>
           <label for="download_delay_max">Pause between downloads, max (s)</label>
-          <input type="number" id="download_delay_max" name="download_delay_max" min="0" step="1">
+          <input type="number" id="download_delay_max" name="download_delay_max" min="0" step="0.001">
+          <span class="hint">Fractional seconds are allowed (e.g. 0.5 = 500 ms) for
+          finer-grained, less predictable pauses.</span>
         </div>
         <div>
           <label for="rate_limit_action">When rate-limited</label>
@@ -920,8 +922,8 @@ async function saveSettings() {
     ydl_verbose: $("#ydl_verbose").checked,
     tls_impersonate: $("#tls_impersonate").value,
     user_agent: $("#user_agent").value,
-    download_delay_min: parseInt($("#download_delay_min").value, 10),
-    download_delay_max: parseInt($("#download_delay_max").value, 10),
+    download_delay_min: parseFloat($("#download_delay_min").value),
+    download_delay_max: parseFloat($("#download_delay_max").value),
     rate_limit_action: $("#rate_limit_action").value,
     rate_limit_backoff_seconds: parseInt($("#rate_limit_backoff_seconds").value, 10),
     smtp_host: $("#smtp_host").value,
