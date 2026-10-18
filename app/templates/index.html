@@ -140,6 +140,15 @@
       </table>
       <p class="hint" id="disk-hint"></p>
     </div>
+
+    <div class="card">
+      <h2>Last run</h2>
+      <table>
+        <thead><tr><th>Item</th><th>Value</th></tr></thead>
+        <tbody id="lastcycle-body"></tbody>
+      </table>
+      <p class="hint" id="lastcycle-hint"></p>
+    </div>
   </section>
 
   <section class="tab-panel" id="panel-settings" hidden>
@@ -339,6 +348,15 @@
         <div>
           <label for="smtp_to">To address</label>
           <input type="text" id="smtp_to" placeholder="where errors are sent">
+        </div>
+        <div class="grow switch-row">
+          <label class="switch" title="Email the last-run summary after each scheduled cycle">
+            <input type="checkbox" id="summary_email" name="summary_email">
+            <span class="slider"></span>
+          </label>
+          <span>Email last-run summary</span>
+          <span class="hint">Sends a short summary (which channels got new videos and how many)
+          to the To address after each scheduled cycle. Needs SMTP configured.</span>
         </div>
       </div>
       <div class="settings-actions">
@@ -544,6 +562,28 @@ async function loadStatus() {
   $("#disk-hint").textContent = (d.fs_free !== null && d.fs_free !== undefined)
     ? "Volume: " + fmtBytes(d.fs_free) + " free of " + fmtBytes(d.fs_total)
     : "";
+  renderLastCycle(d);
+}
+
+// The Last-run card: a short summary of the most recent completed sync cycle —
+// when it ran and which channels got new videos (only those channels are listed,
+// so the summary stays short and relevant).
+function renderLastCycle(d) {
+  const c = d.last_cycle;
+  if (!c) {
+    $("#lastcycle-body").innerHTML = "";
+    $("#lastcycle-hint").textContent = "No sync cycle has completed yet.";
+    return;
+  }
+  const rows = [
+    ["Finished", c.finished_at ? c.finished_at.slice(0, 16) + " UTC" : "…"],
+    ["New videos", String(c.total_new_videos)],
+    ["Channels with new videos", String(c.channels_with_new_videos)],
+  ];
+  $("#lastcycle-body").innerHTML = rows.map(([label, val]) =>
+    "<tr><td>" + label + "</td><td class='dim'>" + esc(val) + "</td></tr>").join("");
+  $("#lastcycle-hint").textContent = (c.channels || []).map((r) =>
+    r.name + ": " + r.new_videos).join(" · ") || "No new videos.";
 }
 
 function renderStatus(s) {
@@ -602,6 +642,7 @@ async function loadSettings() {
   $("#smtp_password").value = s.smtp_password || "";
   $("#smtp_from").value = s.smtp_from || "";
   $("#smtp_to").value = s.smtp_to || "";
+  $("#summary_email").checked = !!s.summary_email;
   $("#proxy_enabled").checked = !!s.proxy_enabled;
   $("#proxy_countries").value = s.proxy_countries || "";
   $("#proxy_timeout_ms").value = s.proxy_timeout_ms ?? "";
@@ -890,6 +931,7 @@ async function saveSettings() {
     smtp_password: $("#smtp_password").value,
     smtp_from: $("#smtp_from").value,
     smtp_to: $("#smtp_to").value,
+    summary_email: $("#summary_email").checked,
     proxy_enabled: $("#proxy_enabled").checked,
     proxy_countries: $("#proxy_countries").value,
     proxy_timeout_ms: parseInt($("#proxy_timeout_ms").value, 10),

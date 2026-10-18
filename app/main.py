@@ -134,6 +134,11 @@ IDLE_SCHEDULE_SLEEP = 300
 # schedule anchors on it so runs stay evenly spaced. In-memory on purpose: a
 # restart re-runs immediately, matching the previous behaviour.
 last_scheduled_run = None
+# Result of the most recent completed sync cycle, kept in memory so the Status
+# tab can show a short "last run" summary (when it ran, how long it took, and
+# which channels got new videos). In-memory on purpose, matching last_scheduled_run.
+last_cycle = None
+last_cycle_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Anti-detection: a consistent identity, human-like pacing, rate-limit handling
@@ -284,6 +289,9 @@ def seed_settings():
         # Log-viewer toggles (see apply_http_log_setting / apply_ydl_log_setting).
         "http_logs": "1",
         "ydl_verbose": "0",
+        # Email the last-run summary after each scheduled cycle (see
+        # maybe_send_cycle_summary_email). Needs SMTP configured to do anything.
+        "summary_email": "0",
         # Anti-detection defaults (see dev/PLANNING-antidetect.md).
         "user_agent": DEFAULT_USER_AGENT,
         "download_delay_min": "5",
@@ -727,6 +735,10 @@ def get_settings():
         "smtp_password": get_setting("smtp_password", ""),
         "smtp_from": get_setting("smtp_from", ""),
         "smtp_to": get_setting("smtp_to", ""),
+        # Email the last-run summary after each scheduled cycle (needs SMTP).
+        "summary_email": get_setting("summary_email", "0") == "1",
+        # Last-run summary for the Status tab (None until the first cycle).
+        "last_cycle": last_cycle_payload(),
         # Anti-detection (see dev/PLANNING-antidetect.md).
         "user_agent": get_setting("user_agent", DEFAULT_USER_AGENT) or DEFAULT_USER_AGENT,
         "download_delay_min": download_delay_min,
@@ -1544,6 +1556,7 @@ def _human_delay():
 
 def sync_channel(channel_url, latest_n):
     log.info("Checking %s (latest_n=%d)", channel_url, latest_n)
+    new_videos = 0  # videos downloaded this cycle — feeds the last-run summary
     max_rotations = _proxy_max_rotations()
     # Fetch the listing, retrying through a rotated proxy when the current
     # egress is rate-limited or a proxy fails. Bounded so a bad pool can never
@@ -1591,6 +1604,7 @@ def sync_channel(channel_url, latest_n):
             try:
                 path = download_video(channel_url, entry["id"])
                 log.info("Downloaded: %s", path.name)
+                new_videos += 1
                 consecutive_rate_limits = 0
                 # Phase 4: record the success (drives the recovery probe).
                 egress_manager.on_success()
@@ -1643,6 +1657,7 @@ def sync_channel(channel_url, latest_n):
                 report_error(f"Failed downloading {entry['id']} ({entry['title']})", exc)
                 break
     enforce_retention(channel_url, latest_n)
+    return new_videos
 
 
 # ---------------------------------------------------------------------------
@@ -1782,12 +1797,14 @@ def _sync_channels():
     # First make sure we are on the newest yt-dlp nightly (see above). This
     # runs under the sync lock, so no other cycle can use yt_dlp mid-reload.
     ensure_latest_ytdlp()
+    # Per-channel new-video counts collected for the last-run summary.
+    results = []
     for ch in load_channels():
         if ch["latest_n"] <= 0:
             # C8: channels with N=0 are skipped during the scheduled poll.
             continue
         try:
-            sync_channel(ch["url"], ch["latest_n"])
+            new_videos = sync_channel(ch["url"], ch["latest_n"])
         except RateLimitedError as exc:
             # A rate-limit abort stops the whole cycle: continuing to hammer
             # other channels from the same IP would only extend the block.
@@ -1795,6 +1812,70 @@ def _sync_channels():
             break
         except Exception as exc:
             report_error(f"Channel sync failed: {ch['url']}", exc)
+            continue
+        if new_videos > 0:
+            results.append({"name": ch["name"] or ch["url"], "new_videos": new_videos})
+    record_last_cycle(results)
+
+
+def record_last_cycle(results):
+    # Snapshot the outcome of a completed sync cycle so the Status tab can show
+    # a short "last run" summary. Kept in memory (like last_scheduled_run): a
+    # restart simply has no summary yet.
+    global last_cycle
+    with last_cycle_lock:
+        last_cycle = {
+            "finished_at": now_iso(),
+            "channels": sorted(results, key=lambda r: -r["new_videos"]),
+        }
+
+
+def last_cycle_payload():
+    # The last-run summary for /api/status: when the cycle ran, which channels
+    # got new videos and how many, plus totals. None until the first cycle
+    # completes.
+    with last_cycle_lock:
+        snapshot = last_cycle
+    if snapshot is None:
+        return None
+    channels = snapshot["channels"]
+    return {
+        "finished_at": snapshot["finished_at"],
+        "total_new_videos": sum(r["new_videos"] for r in channels),
+        "channels_with_new_videos": len(channels),
+        "channels": channels,
+    }
+
+
+def build_cycle_summary(cycle):
+    # A short, plain-text summary of the last cycle for the status page and the
+    # optional email. Only channels that actually got new videos are listed, so
+    # the summary stays relevant even with many tracked channels.
+    lines = [
+        f"Last sync: {cycle['finished_at'][:16]} UTC",
+        f"New videos: {cycle['total_new_videos']} across "
+        f"{cycle['channels_with_new_videos']} channel(s)"
+        if cycle["channels"] else "New videos: none",
+    ]
+    for r in cycle["channels"]:
+        lines.append(f"- {r['name']}: {r['new_videos']}")
+    return "\n".join(lines)
+
+
+def maybe_send_cycle_summary_email():
+    # When the summary-email toggle is on and SMTP is configured, email the
+    # last-cycle summary to the configured recipient. Best-effort: a mail
+    # failure is logged, never raised.
+    if get_setting("summary_email", "0") != "1":
+        return
+    cycle = last_cycle_payload()
+    if cycle is None:
+        return
+    ok, msg = send_email("[video-archiver] Last run summary", build_cycle_summary(cycle))
+    if ok:
+        log.info("Last-run summary email sent")
+    else:
+        log.warning("Failed to send last-run summary email: %s", msg)
 
 
 def sync_all():
@@ -1875,6 +1956,9 @@ def worker():
             report_error("Sync cycle failed", exc)
         elapsed = time.monotonic() - started
         log.info("Scheduled sync cycle finished in %.0fs", elapsed)
+        # Optionally email the last-run summary after each scheduled cycle
+        # (manual refreshes do not send it — the summary is about scheduled runs).
+        maybe_send_cycle_summary_email()
 
 
 # ---------------------------------------------------------------------------
@@ -2155,6 +2239,7 @@ def api_status():
         "paused": settings["paused"],
         "poll_minutes": settings["poll_minutes"],
         "schedule_summary": settings.get("schedule_summary"),
+        "last_cycle": settings.get("last_cycle"),
         **schedule_payload(),
         **_disk_info(),
     })
@@ -2286,6 +2371,8 @@ def api_update_settings():
         set_setting("smtp_from", str(data["smtp_from"]).strip())
     if "smtp_to" in data:
         set_setting("smtp_to", str(data["smtp_to"]).strip())
+    if "summary_email" in data:
+        set_setting("summary_email", "1" if data["summary_email"] else "0")
     # Anti-detection settings (see dev/PLANNING-antidetect.md).
     if "user_agent" in data:
         ua = str(data["user_agent"]).strip()
