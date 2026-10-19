@@ -578,7 +578,7 @@ function renderLastCycle(d) {
     return;
   }
   const rows = [
-    ["Finished", c.finished_at ? c.finished_at.slice(0, 16) + " UTC" : "…"],
+    ["Finished", c.finished_at_local ? c.finished_at_local.slice(0, 16) : "…"],
     ["New videos", String(c.total_new_videos)],
     ["Channels with new videos", String(c.channels_with_new_videos)],
   ];

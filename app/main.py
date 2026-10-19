@@ -1843,8 +1843,18 @@ def last_cycle_payload():
     if snapshot is None:
         return None
     channels = snapshot["channels"]
+    # Wall-clock stamp of the finished cycle in the configured timezone, so the
+    # Status tab's "Last run" card shows the time the user selected rather than
+    # raw UTC. None only if the stored stamp somehow fails to parse.
+    try:
+        tz = resolve_timezone()
+        finished = datetime.fromisoformat(snapshot["finished_at"]).astimezone(tz)
+        finished_local = fmt_local(finished, tz)
+    except ValueError:
+        finished_local = None
     return {
         "finished_at": snapshot["finished_at"],
+        "finished_at_local": finished_local,
         "total_new_videos": sum(r["new_videos"] for r in channels),
         "channels_with_new_videos": len(channels),
         "channels": channels,
@@ -1855,8 +1865,11 @@ def build_cycle_summary(cycle):
     # A short, plain-text summary of the last cycle for the status page and the
     # optional email. Only channels that actually got new videos are listed, so
     # the summary stays relevant even with many tracked channels.
+    # Show the cycle stamp in the configured timezone (the local form already
+    # carries the UTC offset); fall back to the raw ISO stamp if unavailable.
+    stamp = (cycle.get("finished_at_local") or cycle["finished_at"])[:16]
     lines = [
-        f"Last sync: {cycle['finished_at'][:16]} UTC",
+        f"Last sync: {stamp}",
         f"New videos: {cycle['total_new_videos']} across "
         f"{cycle['channels_with_new_videos']} channel(s)"
         if cycle["channels"] else "New videos: none",
@@ -1917,10 +1930,20 @@ def _seconds_until_next_run(schedule, tz):
             return 0.0
         wait = schedule["poll_minutes"] * 60 - (time.time() - last_scheduled_run.timestamp())
         return max(5.0, wait) if wait < 0 else wait
-    runs = upcoming_runs(schedule, tz, datetime.now(tz), count=1)
+    now_local = datetime.now(tz)
+    # A bounded sleep always lands a hair past its target, so a run time that has
+    # just passed (by up to one tick) must still count as due — otherwise the
+    # chunk overshoots the slot and the whole scheduled run is silently skipped.
+    # upcoming_runs only returns slots strictly after the probe, hence the
+    # look-behind window here.
+    probe = now_local - timedelta(seconds=SCHEDULE_TICK_SECONDS)
+    # Slots at or before the previous scheduled start have already fired; without
+    # this filter the look-behind window could re-fire the same slot.
+    runs = [r for r in upcoming_runs(schedule, tz, probe, count=2)
+            if last_scheduled_run is None or r > last_scheduled_run]
     if not runs:
         return None
-    return max(0.0, (runs[0] - datetime.now(tz)).total_seconds())
+    return max(0.0, (runs[0] - now_local).total_seconds())
 
 
 def worker():
