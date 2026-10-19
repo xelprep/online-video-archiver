@@ -35,7 +35,7 @@ from yt_dlp import YoutubeDL
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1881,8 +1881,9 @@ def build_cycle_summary(cycle):
 
 def maybe_send_cycle_summary_email():
     # When the summary-email toggle is on and SMTP is configured, email the
-    # last-cycle summary to the configured recipient. Best-effort: a mail
-    # failure is logged, never raised.
+    # last-cycle summary to the configured recipient. Sent after every cycle —
+    # scheduled, manual all-channel refreshes and single-channel refreshes
+    # alike. Best-effort: a mail failure is logged, never raised.
     if get_setting("summary_email", "0") != "1":
         return
     cycle = last_cycle_payload()
@@ -1915,6 +1916,29 @@ def sync_all_blocking():
         return
     with lock:
         _sync_channels()
+
+
+def sync_one_channel_blocking(channel_url):
+    # Manual single-channel refresh (the per-row Refresh button): wait for the
+    # sync lock like sync_all_blocking, but fetch only this channel's latest
+    # N instead of every tracked channel. Channels with latest_n=0 are rejected
+    # by the endpoint — list_channel(_, 0) would fetch a 100-entry listing and
+    # download nothing, which is pure waste.
+    with lock:
+        ensure_latest_ytdlp()
+        with db() as conn:
+            row = conn.execute("SELECT name, latest_n FROM channels WHERE url=?",
+                               (channel_url,)).fetchone()
+        if row is None:
+            return  # deleted while waiting for the lock
+        new_videos = sync_channel(channel_url, row["latest_n"])
+        results = []
+        if new_videos > 0:
+            results.append({"name": row["name"] or channel_url,
+                            "new_videos": new_videos})
+        # Record like a full cycle so the Last-run card and the summary email
+        # describe whichever cycle ran last, scheduled or manual.
+        record_last_cycle(results)
 
 
 def _seconds_until_next_run(schedule, tz):
@@ -1984,7 +2008,7 @@ def worker():
         elapsed = time.monotonic() - started
         log.info("Scheduled sync cycle finished in %.0fs", elapsed)
         # Optionally email the last-run summary after each scheduled cycle
-        # (manual refreshes do not send it — the summary is about scheduled runs).
+        # (manual refreshes send the same summary when they finish).
         maybe_send_cycle_summary_email()
 
 
@@ -2003,10 +2027,12 @@ refresh_state = {"running": False, "last": None, "error": None}
 refresh_state_lock = threading.Lock()
 
 
-def trigger_refresh():
-    # Kick off an immediate sync cycle in the background. Returns False if a
-    # manual refresh is already in flight. sync_all() itself skips (non-blocking
-    # lock) if the scheduled worker is mid-sync, so cycles never overlap.
+def trigger_refresh(channel_url=None):
+    # Kick off an immediate sync cycle in the background. channel_url=None
+    # refreshes every tracked channel; a channel URL refreshes just that one
+    # (the per-row Refresh button). Returns False if a manual refresh is already
+    # in flight — full and single-channel refreshes share one in-flight slot so
+    # they can never overlap each other or the scheduled worker's sync.
     with refresh_state_lock:
         if refresh_state["running"]:
             return False
@@ -2015,11 +2041,19 @@ def trigger_refresh():
 
     def run():
         try:
-            sync_all_blocking()
+            if channel_url is None:
+                sync_all_blocking()
+            else:
+                sync_one_channel_blocking(channel_url)
         except Exception as exc:
             log.exception("Manual refresh failed")
             with refresh_state_lock:
                 refresh_state["error"] = str(exc)
+        else:
+            # A completed manual refresh emails the same last-run summary the
+            # scheduled cycle sends — the summary describes whichever cycle
+            # ran last, so the user is notified no matter how it was started.
+            maybe_send_cycle_summary_email()
         finally:
             with refresh_state_lock:
                 refresh_state["running"] = False
@@ -2741,6 +2775,35 @@ def api_refresh():
     if is_paused():
         return jsonify({"error": "Archiver is paused — turn on the running switch first."}), 409
     if not trigger_refresh():
+        return jsonify({"status": "already_running"}), 202
+    return jsonify({"status": "started"}), 202
+
+
+@app.post("/api/channels/refresh")
+@require_auth
+@require_csrf
+def api_refresh_channel():
+    # Refresh one channel (the per-row "Refresh" button): fetch just this
+    # channel's latest N instead of running a full all-channel cycle. Shares
+    # refresh_state, so /api/refresh (which the UI polls) reports progress.
+    data = request.get_json(silent=True) or {}
+    url = normalize_channel_url(data.get("url"))
+    if not url:
+        return jsonify({"error": {"url": "Not a valid YouTube channel URL"}}), 400
+    if is_paused():
+        return jsonify({"error": "Archiver is paused — turn on the running switch first."}), 409
+    with db() as conn:
+        row = conn.execute("SELECT latest_n FROM channels WHERE url=?", (url,)).fetchone()
+    if row is None:
+        return jsonify({"error": {"url": "Channel not found"}}), 404
+    if not row["latest_n"]:
+        # Keep-latest 0 channels have no keep window, so there is nothing new
+        # they could pull; explain instead of silently downloading nothing.
+        return jsonify({"hint": ("This channel keeps no latest videos "
+                                 "(keep-latest 0), so there is nothing to "
+                                 "refresh — raise its keep-latest number "
+                                 "first.")}), 200
+    if not trigger_refresh(url):
         return jsonify({"status": "already_running"}), 202
     return jsonify({"status": "started"}), 202
 

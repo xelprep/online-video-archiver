@@ -731,8 +731,10 @@ function renderChannels() {
       '<td class="dim">' + ch.video_count + "</td>" +
       '<td class="n-cell">' + ch.latest_n + "</td>" +
       '<td class="dim">' + esc((ch.added_at || "").slice(0, 10)) + "</td>" +
-      '<td class="row-actions"><button class="ghost edit">Edit</button>' +
+      '<td class="row-actions"><button class="ghost refresh">Refresh</button>' +
+      '<button class="ghost edit">Edit</button>' +
       '<button class="ghost danger delete">Delete</button></td>';
+    tr.querySelector(".refresh").onclick = () => refreshChannel(ch);
     tr.querySelector(".edit").onclick = () => startEdit(tr, ch);
     tr.querySelector(".delete").onclick = () => removeChannel(ch);
     tbody.appendChild(tr);
@@ -793,6 +795,25 @@ function startEdit(tr, ch) {
     } catch (e) { flash("channel-msg", e.message, false); }
   };
   actions.querySelector(".cancel").onclick = () => loadChannels();
+}
+
+// Refresh one channel (the per-row button): POSTs the single-channel endpoint
+// and polls the shared refresh status, like the all-channel Refresh now button.
+// Only keep-latest 0 channels have no keep window — the server explains that
+// via "hint" instead of running a cycle that could download nothing.
+async function refreshChannel(ch) {
+  try {
+    const r = await api("POST", "/api/channels/refresh", { url: ch.url });
+    if (r.hint) { flash("channel-msg", r.hint, false); return; }
+    if (r.status === "already_running") {
+      flash("channel-msg", "A refresh is already in progress…");
+      return;
+    }
+    flash("channel-msg", "Refreshing " + (ch.name || ch.url) + " — checking for new videos…");
+    await pollRefresh();
+  } catch (err) {
+    flash("channel-msg", err.message, false);
+  }
 }
 
 async function removeChannel(ch) {
