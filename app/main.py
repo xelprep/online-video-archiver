@@ -2,6 +2,7 @@ import concurrent.futures
 import contextlib
 import functools
 import hashlib
+import html
 import importlib
 import json
 import logging
@@ -35,7 +36,7 @@ from yt_dlp import YoutubeDL
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.12.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -246,7 +247,8 @@ def init_db():
             url TEXT PRIMARY KEY,
             name TEXT,
             latest_n INTEGER NOT NULL,
-            added_at TEXT NOT NULL
+            added_at TEXT NOT NULL,
+            channel_id TEXT
         );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -261,6 +263,9 @@ def migrate(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(videos)")}
     if "protected" not in cols:
         conn.execute("ALTER TABLE videos ADD COLUMN protected INTEGER NOT NULL DEFAULT 0")
+    chan_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channels)")}
+    if "channel_id" not in chan_cols:
+        conn.execute("ALTER TABLE channels ADD COLUMN channel_id TEXT")
 
 
 def get_setting(key, default=None):
@@ -1216,11 +1221,28 @@ def ydl_opts(download=False, outtmpl=None):
         "restrictfilenames": False,
         "windowsfilenames": True,
         "overwrites": False,
-        "continuedl": True,
+        # Sticky per video, restart on mid-video death: Google Video Server
+        # (GVS) media URLs are IP/session-bound, so resuming a half-fetched
+        # .part file from a *different* egress yields a 403 storm — the classic
+        # "downloads keep getting interrupted" symptom. Resume is therefore OFF:
+        # the egress manager only rotates at whole-video boundaries (the outer
+        # loop), the except-path cleanup deletes hidden partials, and in-run
+        # retries below all stay on the same egress within one YoutubeDL.
+        "continuedl": False,
         "retries": 10,
         "fragment_retries": 10,
+        # 2s between retries gives flaky exits breathing room.
+        "retry_sleep": 2,
         "concurrent_fragment_downloads": 4,
         "socket_timeout": 30,
+        # Gentle fixed jitter between extraction-stage requests (player/webpage
+        # fetches); inter-VIDEO jitter is _human_delay elsewhere.
+        "sleep_requests": 0.5,
+        # Chunked HTTP at exactly 10MB: yt-dlp's default chunking is disabled
+        # (single streaming request) and YouTube throttles chunked fetches
+        # above ~10MB — 10MB chunks keep each request under the throttle while
+        # letting fragment retries recover mid-file deaths on the same egress.
+        "http_chunk_size": 10_000_000,
         "check_formats": True,
         # Remux (never re-encode) into MP4. -movflags +faststart moves the moov
         # atom to the front of the file so Apple TV can begin playback without
@@ -1322,6 +1344,157 @@ def list_channel(channel_url, n):
     return result
 
 
+FEED_ENTRY_LIMIT = 15  # uploads the channel Atom feed always carries
+
+
+def http_get_text(url, timeout=20, max_bytes=2_000_000):
+    # A plain webpage/feed GET — no InnerTube, no bot check. Serves fine even
+    # from bot-walled egress: the wall is on player API calls, not page/feed
+    # fetches, which is what makes feed-based discovery survivable.
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(max_bytes)
+    return raw.decode("utf-8", errors="replace")
+
+
+def resolve_channel_id(channel_url):
+    # Channel URLs come as @handle / /c/Name / /user/Name / /channel/UC….
+    # The ID is embedded in the URL for the last form; otherwise the channel
+    # page's HTML carries "channelId":"UC…" (a plain GET, so this resolves
+    # even while the download egress is bot-walled).
+    m = re.search(r"/channel/([A-Za-z0-9_-]{16,36})", channel_url)
+    if m:
+        return m.group(1)
+    base = re.sub(r"/(videos|shorts|streams|playlists|community|about|search|featured)$", "", channel_url.rstrip("/"))
+    try:
+        page = http_get_text(base, timeout=20)
+        m = re.search(r'"channelId":"([A-Za-z0-9_-]{16,36})"', page)
+        if m:
+            return m.group(1)
+    except Exception as exc:
+        log.debug("channel-id resolution for %s failed: %s", channel_url, exc)
+    return None
+
+
+def ensure_channel_id(channel_url):
+    # Stored channel_id, resolved (and persisted) once when missing.
+    with db() as conn:
+        row = conn.execute("SELECT channel_id FROM channels WHERE url=?", (channel_url,)).fetchone()
+        if row is None:
+            return None
+        if row["channel_id"]:
+            return row["channel_id"]
+    cid = resolve_channel_id(channel_url)
+    if cid:
+        with db() as conn:
+            conn.execute("UPDATE channels SET channel_id=? WHERE url=?", (cid, channel_url))
+    return cid
+
+
+def has_download_history(channel_url):
+    with db() as conn:
+        return conn.execute("SELECT EXISTS(videos WHERE channel_url=?)", (channel_url,)).fetchone()
+
+
+def fetch_channel_feed(channel_id):
+    """Upload list from the channel's Atom feed (plain GET, no InnerTube).
+    Same entry shape as list_channel(). Newest-first."""
+    xml = http_get_text(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}", timeout=20)
+    m = re.search(r"<author>\s*<name>(.*?)</name>", xml, re.S)
+    channel_name = html.unescape(m.group(1)) if m else None
+    entries = []
+    for chunk in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
+        vid = re.search(r"<yt:videoId>([^<]+)", chunk)
+        if not vid:
+            continue
+        pub = re.search(r"<published>(\d{4}-\d{2}-\d{2})", chunk)
+        title = re.search(r"<media:title>(.*?)</media:title>", chunk, re.S)
+        entries.append({
+            "id": vid.group(1),
+            "title": html.unescape(title.group(1)) if title else vid.group(1),
+            "url": f"https://www.youtube.com/watch?v={vid.group(1)}",
+            "upload_date": pub.group(1).replace("-", "") if pub else None,
+            "channel": channel_name,
+        })
+    # Feed entry order is NOT guaranteed newest-first — sort by the stamp.
+    entries.sort(key=lambda e: e["upload_date"] or "", reverse=True)
+    return entries
+
+
+
+def looks_like_short(info):
+    # Primary Shorts signal, from the extraction we already do (zero extra
+    # requests): portrait frame + <=3 minutes is the practical Shorts
+    # signature. Tradeoff to know: a deliberately portrait, sub-3-minute
+    # *regular* upload would also be skipped — flip the threshold in here if
+    # that ever bites you.
+    duration = info.get("duration")
+    width = info.get("width")
+    height = info.get("height")
+    if duration is None or not width or not height:
+        return False
+    return duration <= 180 and height > width
+
+
+def is_short_video(video_id):
+    # Secondary signal (live-verified): GET on watch?v=<id> answers 200 for
+    # regular uploads and 302-redirects to /shorts/<id> for Shorts — YouTube
+    # itself canonicalizes the type. urllib follows the redirect, so the final
+    # URL decides (no body needed); the body canonical regex is a backup for
+    # the rare non-redirect case. Plain GET — no InnerTube, works on walled
+    # egress. None = unknown (fetch failed).
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": DEFAULT_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            final = resp.geturl()
+            if "/shorts/" in final:
+                return True
+            body = resp.read(800_000).decode("utf-8", errors="replace")
+    except Exception as exc:
+        log.debug("short-type probe for %s failed: %s", video_id, exc)
+        return None
+    if re.search(r'(?:href|content)="https?://www\.youtube\.com/shorts/', body):
+        return True
+    return False
+
+
+def list_latest(channel_url, latest_n):
+    # RSS-first discovery: listing a channel via yt-dlp is an InnerTube call —
+    # the bot-defended surface that gets blocked on bad egress. The Atom feed
+    # is a plain GET (one request, no bot defense) carrying the latest 15
+    # uploads, so the steady-state refresh uses it and player calls only happen
+    # for videos actually downloaded. InnerTube tab listing stays for:
+    # - initial seeds when latest_n > 15 (feeds cap at 15 entries; one-time),
+    # - channels whose ID could not be resolved,
+    # - failed/empty feed fetches (transient feed outage vs empty channel).
+    # Feed caveat: members-only uploads are not flagged in the feed, so a
+    # restricted video can occupy a slot in the latest-N window; it is skipped
+    # cleanly (and never recorded) at download time.
+    cid = ensure_channel_id(channel_url)
+    if cid and (has_download_history(channel_url) or latest_n <= FEED_ENTRY_LIMIT):
+        try:
+            entries = fetch_channel_feed(cid)
+        except Exception as exc:
+            log.warning("RSS feed fetch failed for %s (%s); falling back to the yt-dlp tab listing",
+                        channel_url, exc)
+            entries = []
+        if entries:
+            return entries[:latest_n]
+    return list_channel(channel_url, latest_n)
+
+
+
 def get_full_info(video_url):
     opts = ydl_opts(download=False)
     opts["extract_flat"] = False
@@ -1359,6 +1532,14 @@ def download_video(channel_url, video_id, info=None):
     if not info:
         raise RuntimeError(f"Could not extract metadata for {video_id}")
 
+    # Shorts are excluded from the archive by policy. The heuristic runs first
+    # (free — reuses this extraction); the page-canonical probe confirms/catches
+    # landscape Shorts. Returns None = skipped; callers must not count or record.
+    if looks_like_short(info) or is_short_video(video_id) is True:
+        log.warning("Skipping %s (%s): short video, excluded by policy",
+                    video_id, info.get("title") or video_id)
+        return None
+
     uploader = safe_filename(info.get("channel") or info.get("uploader") or "UnknownChannel")
     upload_date = info.get("upload_date") or "unknown-date"
     # Videos live in a per-channel subfolder; the channel name is not part of
@@ -1382,18 +1563,29 @@ def download_video(channel_url, video_id, info=None):
     tmp_template = str(channel_dir / f".{upload_date}-{title}-{video_id}.%(ext)s")
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
+    # Single-extraction download: we already hold the full extraction result
+    # (get_full_info above), so feed it back to yt-dlp as a load-info JSON
+    # instead of letting ydl.download([url]) re-extract the player response —
+    # that second InnerTube call doubles the most bot-sensitive traffic per
+    # video. download_with_info_file consumes the dumped info and re-extracts
+    # from webpage_url itself only on a DownloadError (retry semantics kept).
+    # This halves player calls per sync video: 2 -> 1.
+    info_file = channel_dir / f".info-{video_id}.json"
     try:
+        info_file.write_text(json.dumps(info), encoding="utf-8")
         with YoutubeDL(opts) as ydl:
-            ydl.download([video_url])
+            ydl.download_with_info_file(str(info_file))
     except Exception:
-        # A10: a failed download can leave an orphaned hidden temp file; remove
-        # it (any extension) before propagating the error.
+        # A10: a failed download can leave an orphaned hidden temp file (and
+        # the info JSON) behind; remove them (any extension) before propagating.
         for leftover in channel_dir.glob(f".*-{video_id}.*"):
             try:
                 leftover.unlink(missing_ok=True)
             except OSError:
                 pass
         raise
+    finally:
+        info_file.unlink(missing_ok=True)
 
     candidates = list(channel_dir.glob(f".*-{video_id}.mp4"))
     if not candidates:
@@ -1613,7 +1805,7 @@ def sync_channel(channel_url, latest_n):
     rotations = 0
     while True:
         try:
-            entries = list_channel(channel_url, latest_n)
+            entries = list_latest(channel_url, latest_n)
             break
         except Exception as exc:
             if is_rate_limited_error(exc):
@@ -1652,6 +1844,9 @@ def sync_channel(channel_url, latest_n):
         while True:
             try:
                 path = download_video(channel_url, entry["id"])
+                if path is None:
+                    # Skipped short: neither a download nor an error.
+                    break
                 log.info("Downloaded: %s", path.name)
                 new_videos += 1
                 consecutive_rate_limits = 0
@@ -2158,6 +2353,8 @@ def download_by_url(url_or_id):
     info = get_full_info(video_url)
     if not info:
         raise RuntimeError(f"Could not extract metadata for {video_id}")
+    if looks_like_short(info) or is_short_video(video_id) is True:
+        raise ValueError("Short videos are excluded from the archive (policy)")
     channel_url = resolve_or_add_channel(info) or (
         f"unknown:{info.get('channel') or info.get('uploader') or video_id}"
     )
@@ -2648,10 +2845,14 @@ def api_add_channel():
     if n is None:
         return jsonify({"error": {"latest_n": "Must be an integer >= 0"}}), 400
     name = (data.get("name") or "").strip() or None
+    # Resolve the 24-char channel ID at add time (one plain GET; the feed path
+    # needs it later and walled egress still serves page fetches). Failure is
+    # non-fatal: the ID is re-attempted lazily on later refreshes.
+    channel_id = resolve_channel_id(url)
     with db() as conn:
         cur = conn.execute(
-            "INSERT OR IGNORE INTO channels (url, name, latest_n, added_at) VALUES (?, ?, ?, ?)",
-            (url, name, n, now_iso()),
+            "INSERT OR IGNORE INTO channels (url, name, latest_n, added_at, channel_id) VALUES (?, ?, ?, ?, ?)",
+            (url, name, n, now_iso(), channel_id),
         )
     if cur.rowcount == 0:
         return jsonify({"error": {"url": "Channel already exists"}}), 409

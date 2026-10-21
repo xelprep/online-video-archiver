@@ -243,3 +243,19 @@ back to its own IP immediately.
 - The filename is sanitized for common filesystem-invalid characters, and the YouTube
   video ID is appended, so sanitized-name collisions cannot cause overwrites. The SQLite
   row remains the authoritative identity.
+
+## Discovery is RSS-first (see docs/rss-discovery.md)
+
+Steady-state refresh discovers new uploads via each channel's Atom feed
+(`feeds/videos.xml?channel_id=…`) — a plain GET with no bot defense — instead of
+an InnerTube tab listing, and each downloaded video is extracted exactly once
+(the metadata pass is replayed into the download via load-info JSON). On a
+blocked egress the discovery still works; only the download leg is gated.
+One-time initial seeds with `latest_n > 15` and unresolved channel IDs still
+use the yt-dlp listing. Shorts are excluded by policy (free portrait/≤3min
+heuristic on the extraction plus a plain watch-page canonical probe); live
+streams/premieres still enter the window. Flaky-egress doctrine is encoded in
+the download options: no resume across proxies (GVS URLs are IP-bound; whole
+video restarts on rotation), 10 retries + 10 fragment retries with 2s retry
+sleep, 30s socket timeout, 4 concurrent fragments, 10MB http chunks, and
+0.5s sleep between extraction requests. Details in docs/rss-discovery.md.
