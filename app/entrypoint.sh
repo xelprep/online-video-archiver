@@ -19,20 +19,31 @@
 set -e
 
 if [ "${DNS_CACHE:-1}" != "0" ] && [ "${DNS_CACHE:-1}" != "false" ]; then
-    # Capture the upstream resolver Docker set up before we override it.
-    # DNS_UPSTREAM (env) lets a deploy pin this container's upstream resolver
-    # and bypass the host's DNS chain (Pi-hole → pfSense) — e.g. DNS_UPSTREAM=1.1.1.1
-    # points straight at Cloudflare's resolver. See docs/anti-bot-egress.md.
-    UPSTREAM="${DNS_UPSTREAM:-$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)}"
-    if [ -z "$UPSTREAM" ]; then
-        UPSTREAM=127.0.0.11
+    # Capture the upstream resolver Docker set up before we override anything.
+    # DNS_UPSTREAM (env) is DOMAIN-SCOPED, not global: it becomes a dnsmasq
+    # domain-upstream (dnsmasq --server=/domain/ip) for the YouTube family
+    # (youtube.com/googlevideo.com/ytimg.com + subdomains) so a deploy can
+    # bypass a blocking host chain for YouTube traffic only. Everything else
+    # — crucially peer container names like `bgutil-pot` on the network — keeps
+    # resolving through the Docker-discovered default. A GLOBAL override would
+    # route peer lookups to the external resolver and NXDOMAIN them, breaking
+    # the POT provider wiring; scoping is why this flag is safe.
+    UPSTREAM_DEFAULT=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+    if [ -z "$UPSTREAM_DEFAULT" ]; then
+        UPSTREAM_DEFAULT=127.0.0.11
+    fi
+    set -- dnsmasq --conf-file=/app/dnsmasq.conf --server="$UPSTREAM_DEFAULT"
+    if [ -n "${DNS_UPSTREAM:-}" ]; then
+        for _d in youtube.com googlevideo.com ytimg.com; do
+            set -- "$@" --server="/$_d/$DNS_UPSTREAM"
+        done
     fi
 
     # Point the container's resolver at our local cache.
     echo "nameserver 127.0.0.1" > /etc/resolv.conf
 
-    if dnsmasq --conf-file=/app/dnsmasq.conf --server="$UPSTREAM"; then
-        echo "DNS cache enabled (upstream $UPSTREAM)"
+    if "$@"; then
+        echo "DNS cache enabled (default upstream $UPSTREAM_DEFAULT; ${DNS_UPSTREAM:+YouTube-family scoped to $DNS_UPSTREAM})"
         # Bounded wait until the cache is actually answering; this also warms
         # it with the first lookup. Never fails the entrypoint.
         python - <<'PY'
@@ -47,7 +58,7 @@ PY
     else
         echo "WARNING: dnsmasq failed to start; continuing without DNS cache" >&2
         # Restore the resolver so the app can still reach the upstream.
-        echo "nameserver $UPSTREAM" > /etc/resolv.conf
+        echo "nameserver $UPSTREAM_DEFAULT" > /etc/resolv.conf
     fi
 fi
 
