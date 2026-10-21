@@ -35,7 +35,7 @@ from yt_dlp import YoutubeDL
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -158,6 +158,12 @@ DEFAULT_USER_AGENT = (
 TLS_IMPERSONATE_CHOICES = ("off", "chrome", "safari", "firefox")
 # Valid values for the rate_limit_action setting.
 RATE_LIMIT_ACTIONS = ("abort", "backoff")
+# PO Token provider (bgutil-ytdlp-pot-provider). The compose peer container
+# `bgutil-pot` runs the official token-minting HTTP server; the yt-dlp plugin
+# (installed at image build) talks to it to answer YouTube's Proof-of-Origin
+# token checks. Compose sets POT_SERVER_URL to the service name so plain-DNS
+# peer lookup works; empty disables the wiring. See docs/anti-bot-egress.md.
+POT_SERVER_DEFAULT = os.getenv("POT_SERVER_URL", "http://bgutil-pot:4416")
 # In "backoff" mode, abort the cycle after this many consecutive rate-limits so
 # a hard block does not turn into an endless sleep-and-retry loop.
 RATE_LIMIT_MAX_CONSECUTIVE = 3
@@ -299,6 +305,11 @@ def seed_settings():
         "rate_limit_action": "abort",
         "rate_limit_backoff_seconds": "600",
         "tls_impersonate": "chrome",
+        # PO Token provider + IPv4-only DNS resolution (docs/anti-bot-egress.md).
+        # Both default ON; they only matter when YouTube's bot defenses engage,
+        # and each degrades to today's behaviour when turned off.
+        "pot_provider": "1",
+        "force_ipv4": "1",
         # Phase 4: SOCKS5 proxy rotation (see dev/PLANNING-antidetect.md).
         # Off by default; the pool is built reactively only when the local IP
         # is rate-limited. An empty country list means "all countries".
@@ -677,6 +688,23 @@ def _record_login_failure(ip):
         log.warning("Login throttled for %s after %d failed attempts", ip, count)
 
 
+def pot_server_reachable():
+    # Availability probe of the bgutil POT server, hitting the same {base}/ping
+    # endpoint yt-dlp's plugin uses (see docs/anti-bot-egress.md). Returns
+    # None when the provider setting is off or no URL is configured, True/False
+    # otherwise. Short timeout: a dead peer container must never stall a
+    # settings render.
+    if get_setting("pot_provider", "1") != "1" or not POT_SERVER_DEFAULT:
+        return None
+    import urllib.request
+    try:
+        req = urllib.request.Request(POT_SERVER_DEFAULT + "/ping")
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
 def get_settings():
     try:
         poll_minutes = int(get_setting("poll_minutes", str(POLL_MINUTES_DEFAULT)))
@@ -746,6 +774,11 @@ def get_settings():
         "rate_limit_action": get_setting("rate_limit_action", "abort") or "abort",
         "rate_limit_backoff_seconds": rate_limit_backoff_seconds,
         "tls_impersonate": get_setting("tls_impersonate", "chrome") or "chrome",
+        # PO Token provider + IPv4 resolution (docs/anti-bot-egress.md).
+        # pot_status: None=disabled, True/False=server reachable/unreachable.
+        "pot_provider": get_setting("pot_provider", "1") == "1",
+        "force_ipv4": get_setting("force_ipv4", "1") == "1",
+        "pot_status": pot_server_reachable(),
         # Phase 4: SOCKS5 proxy rotation.
         "proxy_enabled": get_setting("proxy_enabled", "0") == "1",
         "proxy_countries": get_setting("proxy_countries", "") or "",
@@ -1204,6 +1237,18 @@ def ydl_opts(download=False, outtmpl=None):
         # Phase 3: TLS/browser impersonation via curl_cffi. None disables it.
         "impersonate": _impersonate_target(),
     }
+    # PO Token provider: point yt-dlp's POT plugin (pip-installed in the image)
+    # at the bgutil server. extractor_args values must be lists of strings;
+    # the namespace is the plugin's provider name. When the peer container is
+    # down the plugin logs "server is not available" once and yt-dlp proceeds
+    # token-less — i.e. exactly today's behaviour. See docs/anti-bot-egress.md.
+    if get_setting("pot_provider", "1") == "1" and POT_SERVER_DEFAULT:
+        opts["extractor_args"] = {
+            "youtubepot-bgutilhttp": {"base_url": [POT_SERVER_DEFAULT]}
+        }
+    # --force-ipv4 equivalent: resolve yt-dlp's targets over IPv4 records only.
+    if get_setting("force_ipv4", "1") == "1":
+        opts["force_ipv4"] = True
     # Route yt-dlp's own output (status, format selection, download progress)
     # through the logging system so the web Logs tab can show it. Without a
     # logger, yt-dlp writes straight to stdout, which the log stream never sees.
@@ -2486,6 +2531,11 @@ def api_update_settings():
             errors["tls_impersonate"] = "must be one of: " + ", ".join(TLS_IMPERSONATE_CHOICES)
         else:
             set_setting("tls_impersonate", target)
+    # PO Token provider + IPv4 resolution (docs/anti-bot-egress.md).
+    if "pot_provider" in data:
+        set_setting("pot_provider", "1" if data["pot_provider"] else "0")
+    if "force_ipv4" in data:
+        set_setting("force_ipv4", "1" if data["force_ipv4"] else "0")
     # Phase 4: SOCKS5 proxy rotation (see dev/PLANNING-antidetect.md).
     if "proxy_enabled" in data:
         set_setting("proxy_enabled", "1" if data["proxy_enabled"] else "0")

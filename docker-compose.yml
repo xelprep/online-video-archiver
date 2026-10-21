@@ -13,7 +13,32 @@ services:
       TIMEZONE: "UTC"
       LOG_LEVEL: "INFO"
       DATA_DIR: "/data"
+      # Base URL of the bgutil PO-token server peer container below. The
+      # service name IS the hostname inside the compose network — plain-DNS
+      # peer lookup. Overriding this to a host:port only makes sense if you
+      # run the provider image yourself outside compose.
+      POT_SERVER_URL: "http://bgutil-pot:4416"
+      # Optional: pin the DNS cache's upstream resolver (e.g. "1.1.1.1" for
+      # Cloudflare's DoH-on-resolver endpoint) to bypass the host chain
+      # for this container. Unset = discover whatever upstream
+      # Docker set up. See docs/anti-bot-egress.md.
+      # DNS_UPSTREAM: ""
     ports:
       - "8080:8080"
     volumes:
       - ./data:/data
+
+  # PO-token provider peer (see docs/anti-bot-egress.md). This is the SERVER
+  # half of bgutil-ytdlp-pot-provider; the yt-dlp plugin half is pip-installed
+  # inside the archiver image. yt-dlp talks to it over the implicit compose
+  # network (host = service name). We deliberately publish NO port to the host:
+  # the server is unauthenticated, and keeping it inside the compose network
+  # prevents stray local clients from minting tokens / spending resources
+  # through it. The image binds all interfaces internally so peer lookup works
+  # without any port forwarding. shm_size guards the JS runtime's canvas
+  # rendering memory the way browser containers do.
+  bgutil-pot:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-pot
+    restart: unless-stopped
+    shm_size: 1g

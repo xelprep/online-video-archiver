@@ -273,6 +273,35 @@
         </div>
       </div>
 
+      <h3 class="subhead">PO Token provider (bgutil)</h3>
+      <p class="hint">YouTube now demands a <b>Proof-of-Origin token</b> — a fingerprint
+      produced by running its own attestation code — with the format requests of most
+      players. The archiver mints those tokens through the <b>bgutil-pot</b> peer
+      container shipped in docker-compose.yml, which makes the "Sign in to confirm
+      you're not a bot" wall far less likely to trigger on your own IP.
+      <b>On by default.</b> If the peer container is missing the status line says so
+      and downloads proceed token-less. See docs/anti-bot-egress.md for the whole
+      anti-bot picture (and for what to change on your Pi-hole).</p>
+      <div class="grid">
+        <div class="switch-row">
+          <label class="switch" title="Enable PO token provider">
+            <input type="checkbox" id="pot_provider" name="pot_provider" checked>
+            <span class="slider"></span>
+          </label>
+          <span>PO token provider</span>
+        </div>
+        <div class="grow switch-row">
+          <label class="switch" title="Force IPv4 DNS resolution">
+            <input type="checkbox" id="force_ipv4" name="force_ipv4" checked>
+            <span class="slider"></span>
+          </label>
+          <span>Force IPv4 DNS (recommended: keeps yt-dlp from resolving dead AAAA records on mixed networks)</span>
+        </div>
+        <div class="grow">
+          <span id="pot-status-text" class="hint">PO tokens: checking…</span>
+        </div>
+      </div>
+
       <h3 class="subhead">Proxy rotation (SOCKS5)</h3>
       <p class="hint">When YouTube rate-limits your IP, the archiver can route downloads
       through a vetted public SOCKS5 proxy and rotate when one stops working. The pool is
@@ -637,6 +666,16 @@ async function loadSettings() {
   $("#download_delay_max").value = s.download_delay_max ?? "";
   $("#rate_limit_action").value = s.rate_limit_action || "abort";
   $("#rate_limit_backoff_seconds").value = s.rate_limit_backoff_seconds ?? "";
+  $("#pot_provider").checked = s.pot_provider !== false;
+  $("#force_ipv4").checked = s.force_ipv4 !== false;
+  const potEl = $("#pot-status-text");
+  if (s.pot_status === true) {
+    potEl.textContent = "PO tokens: provider server reachable.";
+  } else if (s.pot_status === false) {
+    potEl.textContent = "PO tokens: provider server NOT reachable — downloads fall back token-less.";
+  } else {
+    potEl.textContent = "PO tokens: disabled.";
+  }
   $("#smtp_host").value = s.smtp_host || "";
   $("#smtp_port").value = s.smtp_port || "";
   $("#smtp_encryption").value = s.smtp_encryption || "starttls";

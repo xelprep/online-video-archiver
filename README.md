@@ -25,6 +25,10 @@ A small Docker service that keeps the newest N videos from each configured chann
 - Anti-detection: a realistic browser User-Agent, randomized human-like delays
   between downloads, optional Chrome TLS-fingerprint impersonation, and
   configurable handling of YouTube rate limits (back off and retry, or abort).
+- PO Token provider: compose now ships a bgutil POT-minting peer container and
+  the archiver image installs its yt-dlp plugin half, so YouTube Proof-of-Origin
+  tokens are minted through your own egress IP — see
+  [Anti-bot egress guide](docs/anti-bot-egress.md).
 - Optional SOCKS5 proxy rotation: if the local IP gets rate-limited, the app
   reactively builds a vetted pool of public SOCKS5 proxies and routes downloads
   through them until the local IP is allowed again, then drops back to direct
@@ -178,6 +182,25 @@ All of these are configurable in the **Settings** card of the web UI.
   (default) or **backs off** for a configurable number of seconds and retries,
   up to a small number of consecutive attempts. A 403 "Forbidden" is treated
   the same as a 429, since it is another anti-bot signal.
+
+### PO Token provider (bgutil)
+
+On by default. docker-compose.yml now ships a **second container**, `bgutil-pot`, running
+the official [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+server image; the archiver image pip-installs that project's yt-dlp plugin half. yt-dlp
+mints YouTube **Proof-of-Origin tokens** through the pair — the per-player fingerprint
+YouTube now requires on most clients — which makes the "Sign in to confirm you're not a
+bot" wall far less likely to start on your own IP (it does **not** lift a block that
+already exists; see the guide below for the two states).
+
+- The Settings tab gained two toggles — `PO token provider` and `Force IPv4 DNS` — and a
+  live status line ("provider server reachable / NOT reachable / disabled").
+- `POT_SERVER_URL` (env) points yt-dlp at the peer container over compose's implicit
+  network; no host port is published on the (unauthenticated) server on purpose.
+- `--force-ipv4`-equivalent resolution is default-on for this deploy's network; toggleable in the UI.
+
+Full rationale, verification log lines, the Pi-hole `s.youtube.com` whitelist fix, and the
+egress policy ordering (private first, public last): **[docs/anti-bot-egress.md](docs/anti-bot-egress.md)**.
 
 ### Proxy rotation (off by default)
 

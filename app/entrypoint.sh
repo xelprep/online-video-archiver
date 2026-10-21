@@ -20,7 +20,10 @@ set -e
 
 if [ "${DNS_CACHE:-1}" != "0" ] && [ "${DNS_CACHE:-1}" != "false" ]; then
     # Capture the upstream resolver Docker set up before we override it.
-    UPSTREAM=$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)
+    # DNS_UPSTREAM (env) lets a deploy pin this container's upstream resolver
+    # and bypass the host's DNS chain (Pi-hole → pfSense) — e.g. DNS_UPSTREAM=1.1.1.1
+    # points straight at Cloudflare's resolver. See docs/anti-bot-egress.md.
+    UPSTREAM="${DNS_UPSTREAM:-$(awk '/^nameserver/ {print $2; exit}' /etc/resolv.conf)}"
     if [ -z "$UPSTREAM" ]; then
         UPSTREAM=127.0.0.11
     fi
