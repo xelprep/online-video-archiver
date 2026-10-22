@@ -37,7 +37,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.2"
+APP_VERSION = "1.13.3"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -2092,6 +2092,35 @@ def ensure_latest_ytdlp():
         log.info("yt-dlp updated: %s -> %s (loaded from %s)", current, version, path)
     else:
         log.debug("yt-dlp already current (%s, %s)", version, path)
+    install_thumbnail_guard()  # the reloaded class replaced the previous patch
+
+
+def install_thumbnail_guard():
+    # Normalize `thumbnails` inside yt-dlp itself, not just in our dump path:
+    # on DownloadError yt-dlp re-extracts the video IN-PROCESS (retry semantics)
+    # and bot-walled scrape-fallback variants of that re-extraction carry
+    # `thumbnails` as a bare URL string — our info_to_json_safe guard never
+    # sees it, and _sanitize_thumbnails dies with 'str' has no attribute 'sort'.
+    # Wrapping the class method covers every code path, including those
+    # internal re-extractions. Re-applied after each nightly reload because
+    # the reload replaced the class object.
+    current = YoutubeDL._sanitize_thumbnails
+    if getattr(current, "__app_thumbnails_guard__", False):
+        return  # already installed on this class object (idempotent)
+
+    orig = current
+
+    def guarded(self, info_dict):
+        t = info_dict.get("thumbnails")
+        if isinstance(t, str):
+            log.warning("thumbnails arrived as a bare URL string (re-extraction variant); wrapping")
+            info_dict["thumbnails"] = [{"url": t}]
+        elif isinstance(t, dict):
+            info_dict["thumbnails"] = [t]
+        return orig(self, info_dict)
+
+    guarded.__app_thumbnails_guard__ = True
+    YoutubeDL._sanitize_thumbnails = guarded
 
 
 def _sync_channels():
@@ -3149,6 +3178,7 @@ if __name__ == "__main__":
     # build baked into the image. Cheap no-op after the first upgrade; refresh
     # cycles keep it current as nightlies advance.
     ensure_latest_ytdlp()
+    install_thumbnail_guard()  # no-upgrade startup path: patch the image's class
     # A3: start the worker *before* the HTTP server. Its first action is an
     # immediate sync, which now runs in the background so /health is reachable
     # during the (potentially long) initial sync instead of only after it.
