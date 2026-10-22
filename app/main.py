@@ -37,7 +37,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.13.2"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1491,9 +1491,27 @@ def list_latest(channel_url, latest_n):
         try:
             entries = fetch_channel_feed(cid)
         except Exception as exc:
-            log.warning("RSS feed fetch failed for %s (%s); falling back to the yt-dlp tab listing",
-                        channel_url, exc)
             entries = []
+            if getattr(exc, "code", None) == 404:
+                # A 404 on a known-good-looking UC id means the stored channel_id
+                # is stale (renamed/reclaimed handle). Re-resolve once from the
+                # channel page (plain GET) and retry the feed; persist the fix
+                # so the channel leaves the InnerTube-fallback lane for good.
+                new_cid = resolve_channel_id(channel_url)
+                if new_cid and new_cid != cid:
+                    log.info("RSS feed 404 for %s: stored channel_id %s is stale; re-resolved to %s, retrying feed",
+                             channel_url, cid, new_cid)
+                    with db() as conn:
+                        conn.execute("UPDATE channels SET channel_id=? WHERE url=?", (new_cid, channel_url))
+                    try:
+                        entries = fetch_channel_feed(new_cid)
+                    except Exception as exc2:
+                        log.warning("RSS feed retry failed for %s (%s); falling back to the yt-dlp tab listing",
+                                    channel_url, exc2)
+                        entries = []
+            if not entries:
+                log.warning("RSS feed fetch failed for %s (%s); falling back to the yt-dlp tab listing",
+                            channel_url, exc)
         if entries:
             return entries[:latest_n]
     return list_channel(channel_url, latest_n)
@@ -1536,6 +1554,21 @@ def info_to_json_safe(info):
     # may hold raw bytes — plain json.dumps dies on those ("not JSON
     # serializable"), so materialize/decode lazily on demand. Nested lazies
     # recurse because json's default= re-invokes per unserializable object.
+    # Contract guards: some extraction variants (bot-walled scrape fallbacks
+    # among them) yield `thumbnails` as a single og-image URL STRING rather
+    # than a list of dicts, and json happily serializes it as a string —
+    # yt-dlp's _sanitize_thumbnails then dies with 'str' object has no
+    # attribute 'sort'. Normalize to the documented shape before dumping.
+    info = dict(info)
+    thumbs = info.get("thumbnails")
+    if isinstance(thumbs, str):
+        log.warning("extraction returned thumbnails as a bare URL string; wrapping")
+        info["thumbnails"] = [{"url": thumbs}]
+    fmts = info.get("formats")
+    if isinstance(fmts, str):
+        log.warning("extraction returned formats as a bare string; dropping")
+        info["formats"] = []
+
     def conv(o):
         if isinstance(o, (LazyList, PagedList)):
             # Materialize the container only; json re-visits each element and
