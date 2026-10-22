@@ -37,7 +37,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.13.1"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1401,7 +1401,11 @@ def ensure_channel_id(channel_url):
 
 def has_download_history(channel_url):
     with db() as conn:
-        return conn.execute("SELECT EXISTS(videos WHERE channel_url=?)", (channel_url,)).fetchone()
+        # Universal EXISTS-subquery form: the `EXISTS(<name> WHERE …)` shorthand
+        # (and the alias IN form) are rejected by some sqlite builds with a
+        # plain syntax error, which took down whole channel syncs. The correlated
+        # subquery form works on every sqlite.
+        return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM videos WHERE channel_url=?)", (channel_url,)).fetchone()[0])
 
 
 def fetch_channel_feed(channel_id):
