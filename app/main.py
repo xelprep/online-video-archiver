@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.4"
+APP_VERSION = "1.13.5"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1382,6 +1382,11 @@ def resolve_channel_id(channel_url):
             return m.group(1)
     except Exception as exc:
         log.debug("channel-id resolution for %s failed: %s", channel_url, exc)
+    # No third-party fallback: YouTube oembed 404s on channel URLs and noembed
+    # has no provider for them — the channel page's embedded channelId is the
+    # only free resolution surface. When that page GET is walled, the channel
+    # stays in the InnerTube tab-listing lane; the re-resolve runs again next
+    # cycle and heals the moment the egress can read the page
     return None
 
 
@@ -1632,8 +1637,21 @@ def download_video(channel_url, video_id, info=None):
     info_file = channel_dir / f".info-{video_id}.json"
     try:
         info_file.write_text(info_to_json_safe(info), encoding="utf-8")
-        with YoutubeDL(opts) as ydl:
-            ydl.download_with_info_file(str(info_file))
+        try:
+            with YoutubeDL(opts) as ydl:
+                ydl.download_with_info_file(str(info_file))
+        except Exception as exc:
+            # The load-info lane feeds yt-dlp our dumped extraction shape; on
+            # egress-dependent scrape-fallback variants that shape can be
+            # degraded (stringified fields, dead thumbnail URLs) and yt-dlp's
+            # own retry path dies in places the guards above cannot cover.
+            # Absorb whole crash classes instead of chasing each symptom:
+            # fall back ONCE to the standard full pipeline (re-extract +
+            # download — the pre-optimization behavior) and only then fail.
+            log.info("load-info download for %s failed (%r); falling back to full re-extraction download",
+                     video_id, str(exc)[:160])
+            with YoutubeDL(opts) as ydl:
+                ydl.download([video_url])
     except Exception:
         # A10: a failed download can leave an orphaned hidden temp file (and
         # the info JSON) behind; remove them (any extension) before propagating.
@@ -2144,7 +2162,27 @@ def install_thumbnail_guard():
                         cleaned.append(el)
             if len(cleaned) != len(f):
                 info_dict["formats"] = cleaned
-        return orig(self, info_dict)
+        # Drop dead thumbnail entries outright: empty/non-URL urls make
+        # check_thumbnails HEAD a scheme-less request (NoSupportingHandlers
+        # crash), and non-dict entries break every downstream consumer.
+        th = info_dict.get("thumbnails")
+        if isinstance(th, list):
+            good = [d for d in th
+                    if isinstance(d, dict)
+                    and str(d.get("url") or "").startswith(("http://", "https://"))]
+            if len(good) != len(th):
+                info_dict["thumbnails"] = good
+        try:
+            return orig(self, info_dict)
+        except Exception as exc:
+            # Self-heal: whatever the original sanitize chokes on (network
+            # HEADs through render paths, malformed shapes we did not
+            # enumerate), retry once with thumbnails cleared — sanitize then
+            # short-circuits and the download proceeds for the fields that
+            # matter. Thumbnail display is not data-critical.
+            log.warning("thumbnail pipeline failed (%s); retrying sanitize with thumbnails cleared", exc)
+            info_dict["thumbnails"] = []
+            return orig(self, info_dict)
 
     guarded.__app_thumbnails_guard__ = True
     YoutubeDL._sanitize_thumbnails = guarded
