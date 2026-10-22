@@ -1328,6 +1328,10 @@ def list_channel(channel_url, n):
             e for e in entries
             if e.get("availability") not in RESTRICTED_AVAILABILITY
         ]
+        # Shorts never consume a latest-N slot: the spec keeps the newest N
+        # long-form uploads per channel, so shorts are dropped BEFORE the
+        # N-truncation and before the retry-loop size check.
+        downloadable = [e for e in downloadable if not _short_confirmed(str(e.get("id") or ""))]
         if len(downloadable) >= n or len(entries) <= cap or cap >= 5000:
             break
         cap = min(cap * 2, 5000)
@@ -1492,6 +1496,22 @@ def is_short_video(video_id):
     return False
 
 
+_SHORT_PROBE_CACHE = {}
+
+
+def _short_confirmed(video_id):
+    # Cached 302-canonicalization probe (cheap direct GET). None results are
+    # not cached so a transient fetch failure retries next cycle.
+    if not video_id:
+        return False
+    v = _SHORT_PROBE_CACHE.get(video_id)
+    if v is None:
+        v = is_short_video(video_id)
+        if v is not None:
+            _SHORT_PROBE_CACHE[video_id] = v
+    return v is True
+
+
 def list_latest(channel_url, latest_n):
     # RSS-first discovery: listing a channel via yt-dlp is an InnerTube call —
     # the bot-defended surface that gets blocked on bad egress. The Atom feed
@@ -1531,7 +1551,15 @@ def list_latest(channel_url, latest_n):
                 log.warning("RSS feed fetch failed for %s (%s); falling back to the yt-dlp tab listing",
                             channel_url, exc)
         if entries:
-            return entries[:latest_n]
+            # Spec: keep the newest N LONG-FORM main-channel uploads. The feed
+            # carries no durations, so cheap cached 302 probes decide; if the
+            # 15-entry window cannot fill N long-form (short-heavy channel),
+            # fall back to the InnerTube uploads tab which sees the full
+            # recent history and is itself short-filtered.
+            longform = [e for e in entries if not _short_confirmed(e["id"])]
+            if len(longform) >= latest_n:
+                return longform[:latest_n]
+            return list_channel(channel_url, latest_n)
     return list_channel(channel_url, latest_n)
 
 
