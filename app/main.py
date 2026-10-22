@@ -37,7 +37,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -3106,6 +3106,12 @@ if __name__ == "__main__":
     apply_log_level()
     apply_http_log_setting()
     apply_ydl_log_setting()
+    # Ensure the newest yt-dlp nightly (and with it, the POT provider plugin
+    # registry) BEFORE the worker and the HTTP server start: a manual on-demand
+    # download on a paused, freshly-started container must not run on the older
+    # build baked into the image. Cheap no-op after the first upgrade; refresh
+    # cycles keep it current as nightlies advance.
+    ensure_latest_ytdlp()
     # A3: start the worker *before* the HTTP server. Its first action is an
     # immediate sync, which now runs in the background so /health is reachable
     # during the (potentially long) initial sync instead of only after it.
