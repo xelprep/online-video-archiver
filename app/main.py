@@ -31,6 +31,7 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, session, url_for
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold formats/entries lazily
 # The Python API expects an ImpersonateTarget object (not a raw string) for the
 # "impersonate" param — yt-dlp's CLI does this conversion itself, but the
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
@@ -1525,6 +1526,26 @@ def record_video(channel_url, info, filepath):
         )
 
 
+def info_to_json_safe(info):
+    # Serialize a full extraction result for the load-info round trip. yt-dlp
+    # keeps some info fields LAZY (LazyList/PagedList for formats/entries) and
+    # may hold raw bytes — plain json.dumps dies on those ("not JSON
+    # serializable"), so materialize/decode lazily on demand. Nested lazies
+    # recurse because json's default= re-invokes per unserializable object.
+    def conv(o):
+        if isinstance(o, (LazyList, PagedList)):
+            # Materialize the container only; json re-visits each element and
+            # re-invokes default() for any nested lazy/bytes values. (Do NOT
+            # pre-conv() the elements — dicts/strings must keep native json
+            # handling or dict values turn into str() dumps.)
+            return [x for x in o]
+        if isinstance(o, bytes):
+            return o.decode("utf-8", errors="replace")
+        return str(o)
+
+    return json.dumps(info, default=conv)
+
+
 def download_video(channel_url, video_id, info=None):
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     if info is None:
@@ -1572,7 +1593,7 @@ def download_video(channel_url, video_id, info=None):
     # This halves player calls per sync video: 2 -> 1.
     info_file = channel_dir / f".info-{video_id}.json"
     try:
-        info_file.write_text(json.dumps(info), encoding="utf-8")
+        info_file.write_text(info_to_json_safe(info), encoding="utf-8")
         with YoutubeDL(opts) as ydl:
             ydl.download_with_info_file(str(info_file))
     except Exception:
