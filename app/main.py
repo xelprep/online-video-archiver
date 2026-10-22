@@ -1,3 +1,4 @@
+import ast  # literal_eval repairs stringified formats from scrape-fallback variants
 import concurrent.futures
 import contextlib
 import functools
@@ -37,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.3"
+APP_VERSION = "1.13.4"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -2117,6 +2118,32 @@ def install_thumbnail_guard():
             info_dict["thumbnails"] = [{"url": t}]
         elif isinstance(t, dict):
             info_dict["thumbnails"] = [t]
+        # Same variant normalizes for `formats`: a scrape fallback can carry the
+        # whole list as a string; process_video_result then calls .pop() on its
+        # first CHARATER ('str' has no attribute 'pop'). Sanitize runs before
+        # that consumer site, so repairing here covers the re-extraction lane.
+        f = info_dict.get("formats")
+        if isinstance(f, str):
+            log.warning("formats arrived as a bare string (re-extraction variant); parsing or dropping")
+            try:
+                parsed = ast.literal_eval(f)
+                info_dict["formats"] = parsed if isinstance(parsed, list) else []
+            except (ValueError, SyntaxError):
+                info_dict["formats"] = []
+        elif isinstance(f, list):
+            cleaned = []
+            for x in f:
+                if isinstance(x, dict):
+                    cleaned.append(x)
+                elif isinstance(x, str):
+                    try:
+                        el = ast.literal_eval(x)
+                    except (ValueError, SyntaxError):
+                        continue
+                    if isinstance(el, dict):
+                        cleaned.append(el)
+            if len(cleaned) != len(f):
+                info_dict["formats"] = cleaned
         return orig(self, info_dict)
 
     guarded.__app_thumbnails_guard__ = True
