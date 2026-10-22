@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.5"
+APP_VERSION = "1.13.6"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1424,6 +1424,18 @@ def fetch_channel_feed(channel_id):
     for chunk in re.findall(r"<entry>(.*?)</entry>", xml, re.S):
         vid = re.search(r"<yt:videoId>([^<]+)", chunk)
         if not vid:
+            continue
+        # The channel's "all" feed includes uploads from its SUB-CHANNELS
+        # (and, less commonly, attributed collab channels). Each entry carries
+        # the real uploading channel's <yt:channelId> — filter to the channel
+        # we actually track, otherwise sub-channel videos pollute the latest-N
+        # window: they create folders we never added, inflate row counts, and
+        # push the channel's own recent uploads out of N where retention
+        # deletes them and the feed window never re-fetches them.
+        entry_cid = re.search(r"<yt:channelId>([^<]+)", chunk)
+        if entry_cid and channel_id and entry_cid.group(1) != channel_id:
+            log.debug("feed filter: entry %s belongs to sub-channel %s, not %s",
+                      vid.group(1), entry_cid.group(1), channel_id)
             continue
         pub = re.search(r"<published>(\d{4}-\d{2}-\d{2})", chunk)
         title = re.search(r"<media:title>(.*?)</media:title>", chunk, re.S)
