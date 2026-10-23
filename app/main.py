@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.6"
+APP_VERSION = "1.13.7"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1381,16 +1381,40 @@ def resolve_channel_id(channel_url):
     base = re.sub(r"/(videos|shorts|streams|playlists|community|about|search|featured)$", "", channel_url.rstrip("/"))
     try:
         page = http_get_text(base, timeout=20)
-        m = re.search(r'"channelId":"([A-Za-z0-9_-]{16,36})"', page)
-        if m:
-            return m.group(1)
     except Exception as exc:
         log.debug("channel-id resolution for %s failed: %s", channel_url, exc)
-    # No third-party fallback: YouTube oembed 404s on channel URLs and noembed
-    # has no provider for them — the channel page's embedded channelId is the
-    # only free resolution surface. When that page GET is walled, the channel
-    # stays in the InnerTube tab-listing lane; the re-resolve runs again next
-    # cycle and heals the moment the egress can read the page
+        return None
+    m = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    page_name = html.unescape(m.group(1)).casefold().strip() if m else None
+    candidates = [x.group(1) for x in re.finditer(r'"channelId":"([A-Za-z0-9_-]{16,36})"', page)][:5]
+    rss = re.search(r'<link[^>]*type="application/rss\+xml"[^>]*href="[^"]*channel_id=([A-Za-z0-9_-]{16,36})"', page)
+    if rss:
+        candidates.append(rss.group(1))
+    # Candidates come from embedded "channelId" occurrences (featured/sub-channel
+    # blocks come FIRST on some channels — that resolved @AbsoluteHistory to
+    # Timeline's UC and cross-downloaded the wrong channel's whole feed) and the
+    # declared RSS link (topic/auto-generated UC on rebranded channels, whose
+    # feed 404s — Internet Historian). Neither is authoritative; validate each:
+    # its Atom feed must answer and its <author> name must equal the page's og:title.
+    # Mismatches (featured channels, rebrand topics) are rejected; losing the
+    # feed lane falls back to the tab listing, which is always content-correct.
+    seen = set()
+    for uc in candidates:
+        if uc in seen:
+            continue
+        seen.add(uc)
+        try:
+            xml = http_get_text(f"https://www.youtube.com/feeds/videos.xml?channel_id={uc}", timeout=20)
+        except Exception:
+            continue  # feed for this id does not exist / walled: try next candidate
+        a = re.search(r"<author>\s*<name>(.*?)</name>", xml, re.S)
+        feed_name = html.unescape(a.group(1)).casefold().strip() if a else None
+        if not feed_name or (page_name and feed_name != page_name):
+            log.debug("channel-id candidate %s rejected for %s (feed author %r != page title %r)",
+                      uc, channel_url, feed_name, page_name)
+            continue
+        return uc
+    log.debug("no validated feed id for %s; using the tab-listing lane", channel_url)
     return None
 
 
@@ -2234,8 +2258,16 @@ def _sync_channels():
     # runs under the sync lock, so no other cycle can use yt_dlp mid-reload.
     ensure_latest_ytdlp()
     # Per-channel new-video counts collected for the last-run summary.
+    channels = load_channels()
+    # Randomize per-cycle channel order: a fixed alphabetical scrape sequence
+    # repeating identically every cycle is one of the structural signals that
+    # separates "script" from "human"; rotation costs nothing here because
+    # retention and downloads are order-independent. Rate-limit aborts still
+    # stop the remainder of the cycle, just a random remainder instead of a
+    # deterministic tail.
+    random.shuffle(channels)
     results = []
-    for ch in load_channels():
+    for ch in channels:
         if ch["latest_n"] <= 0:
             # C8: channels with N=0 are skipped during the scheduled poll.
             continue
