@@ -191,15 +191,27 @@ def get_cached_visitor_data():
 
 
 def learn_visitor_data():
-    page = http_get_text("https://www.youtube.com/", timeout=15)
-    m = re.search(r'"visitorData":"([^"]+)"', page)
-    if not m:
-        return get_cached_visitor_data()
-    data = json.dumps({"visitor_data": m.group(1)})
-    tmp = VISITOR_CACHE_PATH.with_suffix(".tmp")
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(VISITOR_CACHE_PATH)
-    return m.group(1)
+    # Lanes: direct first, then the active public proxy (value is not IP-bound,
+    # so learning through the proxy lane is valid). Fall back to cache when all
+    # lanes are walled — an older cached value still mints.
+    lanes = [None]
+    p = egress_manager.current_proxy()
+    if p:
+        lanes.append(p)
+    for proxy in lanes:
+        try:
+            page = http_get_text("https://www.youtube.com/", timeout=15, proxy=proxy)
+        except Exception as exc:
+            log.debug("visitor_data learn failed on lane %s: %s", proxy or "direct", exc)
+            continue
+        m = re.search(r'"visitorData":"([^"]+)"', page)
+        if m:
+            data = json.dumps({"visitor_data": m.group(1)})
+            tmp = VISITOR_CACHE_PATH.with_suffix(".tmp")
+            tmp.write_text(data, encoding="utf-8")
+            tmp.replace(VISITOR_CACHE_PATH)
+            return m.group(1)
+    return get_cached_visitor_data()
 # In "backoff" mode, abort the cycle after this many consecutive rate-limits so
 # a hard block does not turn into an endless sleep-and-retry loop.
 RATE_LIMIT_MAX_CONSECUTIVE = 3
@@ -1449,10 +1461,22 @@ def list_channel(channel_url, n):
 FEED_ENTRY_LIMIT = 15  # uploads the channel Atom feed always carries
 
 
-def http_get_text(url, timeout=20, max_bytes=2_000_000):
+def http_get_text(url, timeout=20, max_bytes=2_000_000, proxy=None):
     # A plain webpage/feed GET — no InnerTube, no bot check. Serves fine even
     # from bot-walled egress: the wall is on player API calls, not page/feed
     # fetches, which is what makes feed-based discovery survivable.
+    if proxy:
+        # socks5h lanes need requests+pysocks (both ship with yt-dlp); the
+        # urllib ProxyHandler cannot speak socks. Used only by the visitor_data
+        # learner, whose value is not IP-bound so learning through a proxy is
+        # valid wherever it succeeds.
+        import requests
+        resp = requests.get(url, timeout=timeout,
+                            proxies={"http": proxy, "https": proxy},
+                            headers={"User-Agent": DEFAULT_USER_AGENT,
+                                     "Accept-Language": "en-US,en;q=0.9"})
+        resp.raise_for_status()
+        return resp.content[:max_bytes].decode("utf-8", errors="replace")
     req = urllib.request.Request(
         url,
         headers={
