@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.7"
+APP_VERSION = "1.13.8"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -167,6 +167,39 @@ RATE_LIMIT_ACTIONS = ("abort", "backoff")
 # token checks. Compose sets POT_SERVER_URL to the service name so plain-DNS
 # peer lookup works; empty disables the wiring. See docs/anti-bot-egress.md.
 POT_SERVER_DEFAULT = os.getenv("POT_SERVER_URL", "http://bgutil-pot:4416")
+
+# --- visitor_data for PO Token minting ----------------------------------------
+# The bgutil POT plugin mints GVS PO Tokens only when handed visitor_data.
+# Normally yt-dlp scrapes it from the watch-page GET; on a bot-walled egress
+# that scrape fails and the plugin silently never mints ("Missing required
+# Visitor Data" → media then fails "Sign in to confirm you're not a bot").
+# We fetch the value ourselves from the plain homepage (cheap direct GET, not
+# through the proxy lane) and cache it on disk, then pass it explicitly via
+# extractor_args. Values are session-level, not IP-bound; an older cached
+# value still mints fine in practice, which is exactly the walled-cycle case
+# this rescues. Freshened once per sync cycle.
+VISITOR_CACHE_PATH = DATA_DIR / "visitor_data.json"
+
+
+def get_cached_visitor_data():
+    try:
+        with open(VISITOR_CACHE_PATH, encoding="utf-8") as f:
+            v = json.load(f).get("visitor_data")
+            return v or None
+    except (OSError, ValueError):
+        return None
+
+
+def learn_visitor_data():
+    page = http_get_text("https://www.youtube.com/", timeout=15)
+    m = re.search(r'"visitorData":"([^"]+)"', page)
+    if not m:
+        return get_cached_visitor_data()
+    data = json.dumps({"visitor_data": m.group(1)})
+    tmp = VISITOR_CACHE_PATH.with_suffix(".tmp")
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(VISITOR_CACHE_PATH)
+    return m.group(1)
 # In "backoff" mode, abort the cycle after this many consecutive rate-limits so
 # a hard block does not turn into an endless sleep-and-retry loop.
 RATE_LIMIT_MAX_CONSECUTIVE = 3
@@ -508,6 +541,59 @@ def apply_log_level():
 # screen output at DEBUG, so the "verbose yt-dlp" toggle below raises this
 # logger to DEBUG to reveal it, independently of the global log level.
 ydl_logger = logging.getLogger("yt_dlp")
+
+# --- Egress-degradation guard -------------------------------------------------
+# When the VPN exit IP goes cold, yt-dlp's curl client logs per-attempt
+# "curl: (28) Connection timed out" lines: every format ladder step costs
+# ~30s, so a dead egress used to grind a whole refresh for hours before
+# erroring every video. Count those strikes centrally (they surface only
+# through the yt-dlp logger, not through our DownloadError messages) and
+# abort the cycle as soon as the pattern is unambiguous — same spirit as the
+# RateLimitedError abort: hammering a suspect IP further only deepens the
+# block. The strikes counter lives on the module so the scheduled/manual
+# cycle wrapper can reset it.
+EGRESS_STRIKES = {"n": 0}
+CONNECT_TIMEOUT_STRIKE_LIMIT = 3
+
+
+def _count_connect_timeout(msg):
+    if isinstance(msg, str) and ("curl: (28)" in msg or "Connection timed out" in msg):
+        EGRESS_STRIKES["n"] += 1
+
+
+class YdlLoggerProxy:
+    # yt-dlp accepts any object with the Logger methods we pass as opts["logger"];
+    # delegate to the real logger and inspect error/warn messages for strikes.
+    def debug(self, msg, *args, **kwargs):
+        ydl_logger.debug(msg, *args, **kwargs)
+
+    def info(self, msg, *args, **kwargs):
+        ydl_logger.info(msg, *args, **kwargs)
+
+    def warning(self, msg, *args, **kwargs):
+        ydl_logger.warning(msg, *args, **kwargs)
+
+    def error(self, msg, *args, **kwargs):
+        _count_connect_timeout(msg)
+        ydl_logger.error(msg, *args, **kwargs)
+
+    def warn(self, msg, *args, **kwargs):
+        _count_connect_timeout(msg)
+        ydl_logger.warning(msg, *args, **kwargs)
+
+    def exception(self, msg, *args, **kwargs):
+        _count_connect_timeout(msg)
+        ydl_logger.exception(msg, *args, **kwargs)
+
+    def critical(self, msg, *args, **kwargs):
+        _count_connect_timeout(msg)
+        ydl_logger.critical(msg, *args, **kwargs)
+
+    def setDebugLevel(self, level):  # noqa: NPE315 — yt-dlp legacy hook
+        ydl_logger.setLevel(level)
+
+
+ydl_logger_proxy = YdlLoggerProxy()
 
 
 def apply_http_log_setting():
@@ -1270,6 +1356,16 @@ def ydl_opts(download=False, outtmpl=None):
         opts["extractor_args"] = {
             "youtubepot-bgutilhttp": {"base_url": [POT_SERVER_DEFAULT]}
         }
+        if download:
+            vd = get_cached_visitor_data()
+            if not vd:
+                try:
+                    vd = learn_visitor_data()
+                except Exception as exc:
+                    log.debug("visitor_data learn failed: %s", exc)
+                    vd = None
+            if vd:
+                opts["extractor_args"]["youtube"] = {"visitor_data": [vd]}
     # --force-ipv4 equivalent: resolve yt-dlp's targets over IPv4 records only.
     if get_setting("force_ipv4", "1") == "1":
         opts["force_ipv4"] = True
@@ -1278,7 +1374,7 @@ def ydl_opts(download=False, outtmpl=None):
     # logger, yt-dlp writes straight to stdout, which the log stream never sees.
     # yt-dlp emits all of this at DEBUG; the "verbose yt-dlp" toggle (see
     # apply_ydl_log_setting) raises ydl_logger to DEBUG to reveal it.
-    opts["logger"] = ydl_logger
+    opts["logger"] = ydl_logger_proxy
     # Phase 4: route through a proxy when the egress manager has one active.
     # (No-op until Phase 4 lands; current_proxy() returns None today.)
     proxy = egress_manager.current_proxy()
@@ -2257,6 +2353,11 @@ def _sync_channels():
     # First make sure we are on the newest yt-dlp nightly (see above). This
     # runs under the sync lock, so no other cycle can use yt_dlp mid-reload.
     ensure_latest_ytdlp()
+    EGRESS_STRIKES["n"] = 0
+    try:
+        learn_visitor_data()  # refresh the POT seed once per cycle (cheap GET)
+    except Exception as exc:
+        log.debug("visitor_data refresh failed, keeping cached: %s", exc)
     # Per-channel new-video counts collected for the last-run summary.
     channels = load_channels()
     # Randomize per-cycle channel order: a fixed alphabetical scrape sequence
@@ -2281,6 +2382,11 @@ def _sync_channels():
         except Exception as exc:
             report_error(f"Channel sync failed: {ch['url']}", exc)
             continue
+        if EGRESS_STRIKES["n"] >= CONNECT_TIMEOUT_STRIKE_LIMIT:
+            log.warning("Stopping sync cycle: %d connect-timeout strikes (curl 28) — "
+                        "egress suspect (cold IP, not a bot wall); aborting cycle, the "
+                        "next poll retries", EGRESS_STRIKES["n"])
+            break
         if new_videos > 0:
             results.append({"name": ch["name"] or ch["url"], "new_videos": new_videos})
     record_last_cycle(results)
