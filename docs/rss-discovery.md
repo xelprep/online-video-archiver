@@ -110,8 +110,34 @@ boundaries:
   feed's 15-entry window (so a window can yield fewer than N downloads); they
   are re-probed cheaply each cycle. A deliberately portrait, sub-3-minute
   regular upload would also be skipped by the heuristic — rare, and the
-  thresholds are the one place to tweak if that ever bites you. Live streams
-  and premieres still enter the window and download when available.
+  thresholds are the one place to tweak if that ever bites you.
+- **Scheduled live events / premieres never occupy a window slot (1.13.9).**
+  The watch-page probe that classifies Shorts now also classifies not-yet-started
+  live events (their watch page carries `LIVE_STREAM_OFFLINE`): like Shorts, they
+  are filtered BEFORE the N-truncation in both listing paths, are skipped with a
+  clean warning if a listing surfaces them anyway (yt-dlp's extraction fails with
+  "This live event will begin in 14 hours." — that is no longer emailed as a
+  failure), and never count in the last-run summary. Currently-airing streams are
+  NOT marked offline and still download; after an event airs, its entry becomes
+  an ordinary ended VOD and a later cycle archives it in full.
+
+## Self-healing channel identity (1.13.9)
+
+A persisted `channel_id` is now bound-checked once per process: one cheap page
+GET (og:title) + one feed GET (author name). If the feed behind the stored id
+answers as a DIFFERENT channel (renamed handle, or an id persisted by an older
+pre-validation resolution), the app logs it, clears the stored id, and
+re-resolves through the validated-candidate procedure — otherwise a foreign
+channel's feed would be downloaded and counted under the added channel every
+cycle (wrong folders, wrong last-run email counts, retention churn). Same-UC
+rebrands keep matching because both names move together.
+
+## Last-run summary email honesty (1.13.9)
+
+The email is sent only after a cycle that actually ran: paused cycles and
+scheduled ticks that found a manual refresh already holding the lock used to
+re-send the PREVIOUS cycle's summary, listing channels with "new videos" that
+have none.
 - **Members-only entries aren't flagged in the feed.** The tab listing used to
   drop subscriber/premium-only entries before counting N. The feed can't tell
   they're restricted, so one can occupy a slot in the window; at download time

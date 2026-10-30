@@ -253,8 +253,10 @@ an InnerTube tab listing, and each downloaded video is extracted exactly once
 blocked egress the discovery still works; only the download leg is gated.
 One-time initial seeds with `latest_n > 15` and unresolved channel IDs still
 use the yt-dlp listing. Shorts are excluded by policy (free portrait/≤3min
-heuristic on the extraction plus a plain watch-page canonical probe); live
-streams/premieres still enter the window. Flaky-egress doctrine is encoded in
+heuristic on the extraction plus a plain watch-page canonical probe); scheduled
+live events/premieres are filtered the same way (their watch page answers
+`LIVE_STREAM_OFFLINE`) and archive as full VODs once they air — currently-airing
+streams still enter the window and download. Flaky-egress doctrine is encoded in
 the download options: no resume across proxies (GVS URLs are IP-bound; whole
 video restarts on rotation), 10 retries + 10 fragment retries with 2s retry
 sleep, 30s socket timeout, 4 concurrent fragments, 10MB http chunks, and

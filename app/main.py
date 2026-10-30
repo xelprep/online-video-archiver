@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.8"
+APP_VERSION = "1.13.9"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -1439,7 +1439,7 @@ def list_channel(channel_url, n):
         # Shorts never consume a latest-N slot: the spec keeps the newest N
         # long-form uploads per channel, so shorts are dropped BEFORE the
         # N-truncation and before the retry-loop size check.
-        downloadable = [e for e in downloadable if not _short_confirmed(str(e.get("id") or ""))]
+        downloadable = [e for e in downloadable if not _window_excluded(str(e.get("id") or ""))]
         if len(downloadable) >= n or len(entries) <= cap or cap >= 5000:
             break
         cap = min(cap * 2, 5000)
@@ -1497,6 +1497,7 @@ def resolve_channel_id(channel_url):
     # even while the download egress is bot-walled).
     m = re.search(r"/channel/([A-Za-z0-9_-]{16,36})", channel_url)
     if m:
+        FEED_ID_OK.add((channel_url, m.group(1)))
         return m.group(1)
     base = re.sub(r"/(videos|shorts|streams|playlists|community|about|search|featured)$", "", channel_url.rstrip("/"))
     try:
@@ -1533,6 +1534,7 @@ def resolve_channel_id(channel_url):
             log.debug("channel-id candidate %s rejected for %s (feed author %r != page title %r)",
                       uc, channel_url, feed_name, page_name)
             continue
+        FEED_ID_OK.add((channel_url, uc))
         return uc
     log.debug("no validated feed id for %s; using the tab-listing lane", channel_url)
     return None
@@ -1599,6 +1601,52 @@ def fetch_channel_feed(channel_id):
     return entries
 
 
+FEED_ID_OK = set()  # (channel_url, channel_id) pairs bound this process lifetime
+
+
+def _feed_identity_ok(channel_url, cid):
+    # A persisted channel_id is trusted blindly by ensure_channel_id, and ids set
+    # BEFORE the validated-candidate resolution existed (or after a handle
+    # re-point) can answer for a DIFFERENT channel — every cycle then downloads
+    # that foreign channel's newest N under the added channel: files land in the
+    # other channel's folder, retention churns the foreign rows forever, and the
+    # summary email counts videos the added channel never posted. Bind the id to
+    # the page: one cheap page GET + one feed GET per (url, cid) per process; a
+    # feed author name different from the page og:title proves mismatch (same-UC
+    # renames move both names together, so legitimate rebrands keep matching).
+    if (channel_url, cid) in FEED_ID_OK:
+        return True
+    base = re.sub(r"/(videos|shorts|streams|playlists|community|about|search|featured)$",
+                  "", channel_url.rstrip("/"))
+    try:
+        page = http_get_text(base, timeout=20)
+    except Exception as exc:
+        log.debug("feed identity check: page fetch for %s failed: %s", channel_url, exc)
+        return True
+    m = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    page_name = html.unescape(m.group(1)).casefold().strip() if m else None
+    if not page_name:
+        return True
+    try:
+        xml = http_get_text(f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}", timeout=20)
+    except Exception as exc:
+        log.debug("feed identity check: feed fetch for %s failed: %s", cid, exc)
+        return True  # the feed-404 self-heal path in list_latest owns that case
+    a = re.search(r"<author>\s*<name>(.*?)</name>", xml, re.S)
+    feed_name = html.unescape(a.group(1)).casefold().strip() if a else None
+    if not feed_name:
+        return True
+    if feed_name != page_name:
+        log.warning(
+            "stored channel_id %s for %s answers as feed author %r, not the page title %r: "
+            "the persisted id points at another channel (stale/poisoned); clearing it to re-resolve",
+            cid, channel_url, feed_name, page_name,
+        )
+        return False
+    FEED_ID_OK.add((channel_url, cid))
+    return True
+
+
 
 def looks_like_short(info):
     # Primary Shorts signal, from the extraction we already do (zero extra
@@ -1614,13 +1662,23 @@ def looks_like_short(info):
     return duration <= 180 and height > width
 
 
-def is_short_video(video_id):
-    # Secondary signal (live-verified): GET on watch?v=<id> answers 200 for
-    # regular uploads and 302-redirects to /shorts/<id> for Shorts — YouTube
-    # itself canonicalizes the type. urllib follows the redirect, so the final
-    # URL decides (no body needed); the body canonical regex is a backup for
-    # the rare non-redirect case. Plain GET — no InnerTube, works on walled
-    # egress. None = unknown (fetch failed).
+_WATCH_TYPE_CACHE = {}  # video_id -> "short" | "upcoming_live" | "normal"
+
+
+def watch_type_probe(video_id):
+    # One cheap direct GET classifies the entry type from the SAME canonicalization
+    # probe that used to answer only Shorts: regular uploads answer with a watch
+    # URL, YouTube 302-redirects Shorts to /shorts/<id>, and a scheduled live
+    # event/premiere that has not started carries the offline-playability marker
+    # LIVE_STREAM_OFFLINE in the watch page (verified against a real scheduled
+    # event). A CURRENTLY-airing stream does NOT carry it — its media is
+    # downloadable now, so ongoing streams stay on the download path. None =
+    # unknown (fetch failed); any other result is cached per video id.
+    if not video_id:
+        return None
+    t = _WATCH_TYPE_CACHE.get(video_id)
+    if t is not None:
+        return t
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         req = urllib.request.Request(url, headers={
@@ -1630,30 +1688,42 @@ def is_short_video(video_id):
         with urllib.request.urlopen(req, timeout=20) as resp:
             final = resp.geturl()
             if "/shorts/" in final:
-                return True
-            body = resp.read(800_000).decode("utf-8", errors="replace")
+                t = "short"
+            else:
+                body = resp.read(800_000).decode("utf-8", errors="replace")
+                if re.search(r'(?:href|content)="https?://www\.youtube\.com/shorts/', body):
+                    t = "short"
+                elif '"LIVE_STREAM_OFFLINE"' in body:
+                    t = "upcoming_live"
+                else:
+                    t = "normal"
     except Exception as exc:
-        log.debug("short-type probe for %s failed: %s", video_id, exc)
+        log.debug("watch-type probe for %s failed: %s", video_id, exc)
         return None
-    if re.search(r'(?:href|content)="https?://www\.youtube\.com/shorts/', body):
-        return True
-    return False
+    _WATCH_TYPE_CACHE[video_id] = t
+    return t
 
 
-_SHORT_PROBE_CACHE = {}
+def is_short_video(video_id):
+    # Tri-state for the extraction lane: True = short, False = regular, None =
+    # probe failed. Backed by the shared watch-type probe.
+    t = watch_type_probe(video_id)
+    return None if t is None else t == "short"
 
 
 def _short_confirmed(video_id):
-    # Cached 302-canonicalization probe (cheap direct GET). None results are
-    # not cached so a transient fetch failure retries next cycle.
-    if not video_id:
-        return False
-    v = _SHORT_PROBE_CACHE.get(video_id)
-    if v is None:
-        v = is_short_video(video_id)
-        if v is not None:
-            _SHORT_PROBE_CACHE[video_id] = v
-    return v is True
+    return watch_type_probe(video_id) == "short"
+
+
+def _window_excluded(video_id):
+    # Entries that never occupy a latest-N slot: Shorts are policy-excluded, and
+    # a scheduled live event has nothing to archive yet — left in the window it
+    # fails at extraction, fires a per-video failure email, and while several
+    # events queue up it starves the channel's real uploads out of the window
+    # (they age out and never get archived). After the event airs, the SAME feed
+    # entry answers as a normal/ended page and a later cycle archives the full VOD.
+    t = watch_type_probe(video_id)
+    return t in ("short", "upcoming_live")
 
 
 def list_latest(channel_url, latest_n):
@@ -1669,6 +1739,10 @@ def list_latest(channel_url, latest_n):
     # restricted video can occupy a slot in the latest-N window; it is skipped
     # cleanly (and never recorded) at download time.
     cid = ensure_channel_id(channel_url)
+    if cid and not _feed_identity_ok(channel_url, cid):
+        with db() as conn:
+            conn.execute("UPDATE channels SET channel_id=NULL WHERE url=?", (channel_url,))
+        cid = ensure_channel_id(channel_url)  # validated re-resolve, or None -> tab lane
     if cid and (has_download_history(channel_url) or latest_n <= FEED_ENTRY_LIMIT):
         try:
             entries = fetch_channel_feed(cid)
@@ -1700,7 +1774,7 @@ def list_latest(channel_url, latest_n):
             # 15-entry window cannot fill N long-form (short-heavy channel),
             # fall back to the InnerTube uploads tab which sees the full
             # recent history and is itself short-filtered.
-            longform = [e for e in entries if not _short_confirmed(e["id"])]
+            longform = [e for e in entries if not _window_excluded(e["id"])]
             if len(longform) >= latest_n:
                 return longform[:latest_n]
             return list_channel(channel_url, latest_n)
@@ -1905,6 +1979,21 @@ def is_age_restricted_error(exc):
     # their rate-limit meaning.
     msg = str(exc).lower()
     return "age-restricted" in msg or ("sign in to confirm" in msg and "age" in msg)
+
+
+def is_upcoming_live_error(exc):
+    # Scheduled live stream / premiere: yt-dlp fails at extraction with a
+    # server-provided phrase, e.g. "This live event will begin in 14 hours."
+    # Match stable phrases (not bare "begin") so the sync lane can skip
+    # permanently-unstarted events instead of emailing them each cycle.
+    msg = str(exc).lower()
+    return (
+        "live event will begin" in msg
+        or "will begin in" in msg
+        or "will start in" in msg
+        or "hasn\'t started yet" in msg
+        or "has not started yet" in msg
+    )
 
 
 class RateLimitedError(Exception):
@@ -2117,6 +2206,19 @@ def sync_channel(channel_url, latest_n):
                 _human_delay()
                 break
             except Exception as exc:
+                if is_upcoming_live_error(exc):
+                    # Scheduled live stream/premiere: yt-dlp's EXTRACTION fails
+                    # with the server phrase ("This live event will begin in
+                    # 14 hours."). A not-yet-started event is permanent, not an
+                    # egress/auth problem: skip with a clean warning, no error
+                    # email, no rate-limit/proxy reaction, not counted. Once it
+                    # airs, its listing entry becomes an ordinary ended VOD and
+                    # a later cycle archives it in full.
+                    log.warning(
+                        "Skipping %s (%s): scheduled live event, has not started yet",
+                        entry["id"], entry["title"],
+                    )
+                    break
                 if is_age_restricted_error(exc):
                     # Age-restricted video: a permanent per-video auth wall,
                     # not a bot block. Skip it and move on to the next video
@@ -2493,14 +2595,15 @@ def maybe_send_cycle_summary_email():
 def sync_all():
     if is_paused():
         log.info("Archiver is paused; skipping sync")
-        return
+        return False
     if not lock.acquire(blocking=False):
         log.info("Sync already running; skipping overlapping cycle")
-        return
+        return False
     try:
         _sync_channels()
     finally:
         lock.release()
+    return True
 
 
 def sync_all_blocking():
@@ -2596,14 +2699,18 @@ def worker():
         last_scheduled_run = datetime.now(tz)
         started = time.monotonic()
         try:
-            sync_all()
+            ran_cycle = sync_all()
         except Exception as exc:
             report_error("Sync cycle failed", exc)
+            ran_cycle = False
         elapsed = time.monotonic() - started
         log.info("Scheduled sync cycle finished in %.0fs", elapsed)
-        # Optionally email the last-run summary after each scheduled cycle
-        # (manual refreshes send the same summary when they finish).
-        maybe_send_cycle_summary_email()
+        # Email the summary only after a cycle that actually RAN: a skipped
+        # cycle (paused, or a manual refresh holding the lock) left the PREVIOUS
+        # cycle's record in place, and re-sending that summary each tick told
+        # the user about downloads on channels that have none.
+        if ran_cycle:
+            maybe_send_cycle_summary_email()
 
 
 # ---------------------------------------------------------------------------
