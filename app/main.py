@@ -2107,6 +2107,31 @@ def download_video(channel_url, video_id, info=None):
         record_video(channel_url, info, final_path)
         return final_path
 
+    # A stopped container is the interesting case: `docker stop` sends SIGTERM,
+    # and a SIGTERM'd process runs neither the except-path cleanup below nor its
+    # finally, so the in-flight video leaves hidden artifacts in its channel
+    # folder. A .part file is inert by itself (continuedl is off, so yt-dlp
+    # rewrites from byte 0 rather than resuming - GVS media URLs are IP/session
+    # bound, and resuming across an egress change is the classic 403 storm). The
+    # hazard is a kill landing inside ffmpeg's mux: that leaves a TRUNCATED file
+    # at the hidden output name itself, while the existence check above looks at
+    # the FINAL name and the candidate glob below looks at the hidden one - so
+    # the partial gets renamed into the archive, recorded as a complete video,
+    # and never fetched again. +faststart keeps the moov atom at the front, so
+    # even ffprobe reads it as full length: the damage is invisible to the tools
+    # we run. Drop anything a previous attempt left for THIS video before
+    # starting (which also stops yt-dlp's own "file already exists" skip, since
+    # overwrites is off), so the only candidate below is one this attempt wrote.
+    # A complete hidden leftover from an attempt that died between "yt-dlp
+    # finished" and "file renamed" is therefore re-fetched instead of adopted -
+    # one video's traffic, in exchange for never archiving unfinished bytes.
+    stale = [p for p in channel_dir.glob(f".*-{video_id}.*") if p.is_file()]
+    if stale:
+        log.info("Pruning %d leftover artifact(s) from an interrupted attempt for %s: %s",
+                 len(stale), video_id, ", ".join(p.name for p in stale))
+        for p in stale:
+            p.unlink(missing_ok=True)
+
     tmp_template = str(channel_dir / f".{upload_date}-{title}-{video_id}.%(ext)s")
     opts = ydl_opts(download=True, outtmpl=tmp_template)
     opts["extract_flat"] = False
@@ -2156,6 +2181,12 @@ def download_video(channel_url, video_id, info=None):
         raise RuntimeError(f"Download completed but output file for {video_id} was not found")
 
     source = candidates[0]
+    if not source.stat().st_size:
+        # A died merge stage can leave an empty container where the output
+        # belongs; an empty file must never become the archive (or the DB row
+        # that would suppress fetching the video again).
+        source.unlink(missing_ok=True)
+        raise RuntimeError(f"Download for {video_id} produced an empty file")
     if final_path.exists():
         source.unlink(missing_ok=True)
     else:

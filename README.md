@@ -245,6 +245,25 @@ thousands of other users share, so this is a last resort, not a better egress.
 Full ordering, the daemon-start mechanics, and the limits:
 **[docs/anti-bot-egress.md](docs/anti-bot-egress.md) § 5**.
 
+### If you stop the container mid-download
+
+`docker stop` sends SIGTERM, and a SIGTERM'd process runs neither the download
+lane's error cleanup nor its `finally`, so the in-flight video leaves hidden
+artifacts in its channel folder. The lane now discards a previous attempt's
+artifacts for that video before it starts a new one. A partial `.part` was
+already inert (`continuedl` is off — the download restarts from byte 0 rather
+than resuming, because Google Video Server media URLs are IP/session-bound and
+resuming across an egress change is what produces the 403 storm). The real
+hazard was a kill landing inside ffmpeg's mux: that leaves a *truncated* file at
+the temporary output name, which used to be renamed into the archive, recorded as
+a complete video, and never fetched again — `+faststart` keeps the moov atom at
+the front, so even `ffprobe` reads such a file as full length. Nothing is lost
+either way: no DB row is written until a download succeeds, so the video is
+re-attempted on the next cycle. The cost is one video's traffic, in exchange for
+never archiving unfinished bytes. This guards attempts made from here on; a file
+already corrupted by an older version stays on disk until you delete it and
+re-fetch (the on-demand download by URL re-records a specific video).
+
 ## Notes
 
 - The HTTP server binds to `0.0.0.0` inside the container, so it is reachable from your
