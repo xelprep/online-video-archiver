@@ -342,6 +342,34 @@
         <button type="button" id="proxy-reset-btn" class="ghost">Reset to direct</button>
       </div>
 
+      <h3 class="subhead">Tor fallback (SOCKS5 via Tor)</h3>
+      <p class="hint">A second escape hatch for a bot-blocked IP: route through a Tor exit
+      node instead of a public SOCKS5 pool. Tor exits are <b>public infrastructure too</b>
+      — Google keeps blocklists of known exit IPs and one exit is shared by thousands of
+      users — so this is a last resort, not a better egress. Nothing touches Tor until
+      your direct connection is actually blocked, and the archiver still drops back to
+      direct once you recover. <b>Off by default.</b></p>
+      <div class="grid">
+        <div class="switch-row">
+          <label class="switch" title="Enable Tor egress">
+            <input type="checkbox" id="tor_enabled" name="tor_enabled">
+            <span class="slider"></span>
+          </label>
+          <span>Enable Tor</span>
+        </div>
+        <div>
+          <label for="tor_priority">Which egress first</label>
+          <select id="tor_priority" name="tor_priority">
+            <option value="proxy_first">Proxy pool first (recommended)</option>
+            <option value="tor_first">Tor first</option>
+          </select>
+        </div>
+        <div class="grow">
+          <label for="tor_socks_url">Tor SOCKS endpoint</label>
+          <input type="text" id="tor_socks_url" name="tor_socks_url" placeholder="socks5h://127.0.0.1:9050" spellcheck="false">
+        </div>
+      </div>
+
       <h3 class="subhead">Error email (SMTP)</h3>
       <p class="hint">When the archiver hits an error it can email you, so failures are visible
       even when running unattended. For <b>Gmail</b>: create an <b>App Password</b>
@@ -690,19 +718,26 @@ async function loadSettings() {
   $("#proxy_vet_limit").value = s.proxy_vet_limit ?? "";
   $("#proxy_recovery_probe_every").value = s.proxy_recovery_probe_every ?? "";
   $("#proxy_max_rotations").value = s.proxy_max_rotations ?? "";
+  $("#tor_enabled").checked = !!s.tor_enabled;
+  $("#tor_priority").value = s.tor_priority || "proxy_first";
+  $("#tor_socks_url").value = s.tor_socks_url || "";
 }
 
 async function loadProxyStatus() {
   try {
     const p = await api("GET", "/api/proxy");
     const el = $("#proxy-status-text");
-    if (!p.enabled) {
-      el.textContent = "Proxy rotation is off.";
+    if (p.state === "tor") {
+      el.textContent = "Routing via Tor exit " + (p.tor_endpoint || "…") +
+        " — public infrastructure, so an exit Google has not flagged is not guaranteed.";
+    } else if (!p.enabled) {
+      el.textContent = "Proxy/Tor escalation is off.";
     } else if (p.state === "proxy") {
       el.textContent = "Routing via proxy " + (p.current_proxy || "…") +
         " (" + p.pool_size + " in pool, " + p.consecutive_rotations + " rotations).";
     } else {
-      el.textContent = "Direct egress (proxy pool: " + p.pool_size + ").";
+      el.textContent = "Direct egress (proxy pool: " + p.pool_size +
+        (p.tor_running ? ", tor daemon warmed up" : "") + ").";
     }
   } catch (e) {
     $("#proxy-status-text").textContent = "Egress: " + e.message;
@@ -1000,6 +1035,9 @@ async function saveSettings() {
     proxy_vet_limit: parseInt($("#proxy_vet_limit").value, 10),
     proxy_recovery_probe_every: parseInt($("#proxy_recovery_probe_every").value, 10),
     proxy_max_rotations: parseInt($("#proxy_max_rotations").value, 10),
+    tor_enabled: $("#tor_enabled").checked,
+    tor_priority: $("#tor_priority").value,
+    tor_socks_url: $("#tor_socks_url").value,
   });
 }
 

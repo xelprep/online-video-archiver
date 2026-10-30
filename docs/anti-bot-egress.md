@@ -23,8 +23,15 @@ a last-resort fallback, not the answer.
    Google flags well-known public-infrastructure IPs roughly the way it flags any
    public list; keep this as the fallback it already is (it only activates when your
    direct IP is already throttled, and drops back as soon as you recover).
+4. **Tor exit nodes (the opt-in `tor_enabled` lane) — below the pool, same public
+   category.** Tor is not a private exit: one exit node serves thousands of users and
+   Google keeps blocklists of known exit IPs. It sits below tier 3 because the pool is
+   re-vetted per cycle, rotates on failure and is already warm at escalation time,
+   whereas Tor is a single fixed exit with a cold bootstrap and nothing to rotate
+   through. Flipping `tor_priority` to `tor_first` is the deploy-network-specific
+   exception (public SOCKS pools dead on your network, Tor reaching YouTube fine).
 
-Never promote tier 3 above tier 1. Intermediary services (Invidious/Piped instances)
+Never promote tier 3 or 4 above tier 1. Intermediary services (Invidious/Piped instances)
 are the same tier-3 category: their own backend IPs get Google-blocked and current
 Piped stacks cannot pass YouTube's defenses at all.
 
@@ -157,4 +164,85 @@ NXDOMAIN — yt-dlp's own pinned tracker entry #8149 is "disable pi-hole or whit
   wired or already-blocked IP (see the two states in §1).
 - If you flip `pot_provider` off or delete the peer container, nothing else changes:
   plugin inert, token-less path, today's behavior.
+
+## 5. The Tor lane (app 1.14.0): what it is, and why it sits below the pool
+
+`tor_enabled` adds a second escape hatch beside the SOCKS5 pool: when the direct
+IP is bot-blocked, route through a Tor exit node instead. Same reactive contract
+as the pool — nothing touches Tor until a rate-limit/bot signal actually happens,
+and the direct recovery probe still drops back as soon as you are throttled no
+more.
+
+**Order matters, and the default is the pool first.** Both tiers are public
+infrastructure (Google maintains blocklists of known Tor exit IPs, and one exit
+serves thousands of users), but the pool is a *searchable* public tier: it is
+re-vetted every cycle with a real extract+download, rotated on failure, and
+already warm at escalation time. Tor is one fixed exit with a cold bootstrap
+(~10 s of onionroot/relay fetches before a clearnet circuit exists) and nothing
+to rotate through when that exit is a bad one. So the ladder is:
+
+```
+direct  ->  vetted pool (rotate, re-vet)  ->  Tor exit  ->  give up (abort/backoff)
+```
+
+`tor_priority = tor_first` inverts the middle two for deploy networks where
+public SOCKS pools are dead but a Tor circuit reaches YouTube; the pool is still
+tried once Tor has been used and comes back exhausted.
+
+### How the daemon is started (and why it is that way)
+
+- `ensure_tor()` first probes the configured endpoint (`tor_socks_url`,
+  default `socks5h://127.0.0.1:9050`). If something already listens there — a
+  tor peer container on the compose network, a tor daemon on the NAS host — it
+  is used as-is, which is how you keep Tor outside the app image if you prefer.
+- Otherwise the image's own `tor` (installed by the Dockerfile apt line) is
+  started. tor 0.4.9.15 as shipped in the image rejects a custom torrc's option
+  spellings (`Socks5Port`, `LogLevel`, `HiddenRoot`, `module-config` all answer
+  "Unknown option"), so the daemon is started with its built-in defaults and
+  only the *environment* is shaped: tor's private data dir is `$HOME/.tor` and
+  the container's HOME is not writable by the unprivileged `appuser`, so HOME
+  is pointed at `DATA_DIR/tor`. Verified in the deploy image: tor started as
+  `appuser` with that HOME opens `127.0.0.1:9050`; started without it, tor dies
+  with "Couldn't create private data directory".
+- The daemon is left running until you press **Reset to direct** or turn Tor
+  off, so the next escalation gets a warm circuit.
+
+### Two facts this change depends on (verified against current source)
+
+- **SOCKS needs PySocks.** Without it, both `requests` and yt-dlp's requests-
+  based sessions raise `Missing dependencies for SOCKS support` — for the pool
+  lane *and* the Tor lane. `requirements.txt` gained `pysocks` for that reason;
+  the symptom is a `Missing dependencies for SOCKS support` line in the logs
+  while the pool status card still claims a proxy is active.
+- **PO tokens mint through the lane in use.** yt-dlp's YouTube extractor sets
+  `request_proxy = select_proxy('https://www.youtube.com', proxies) or
+  select_proxy(inntertube_host, proxies)`, and the bgutil HTTP provider sends
+  that as the server's `proxy` field. So a Tor-routed download asks the provider
+  server to fetch the BotGuard challenge through the same Tor endpoint — the
+  same-egress doctrine from §1 keeps holding under Tor, rather than minting on
+  the container's blocked IP and spending the token from an exit node.
+
+### Honest limits
+
+- A Tor exit is a public IP: it may already be flagged, and it is shared. Treat
+  a working Tor cycle as *archiving continued*, exactly like the pool caveat.
+- Exit stickiness is per instance, not guaranteed per video: measured in the
+  deploy image, six same-host requests through one tor instance reused a single
+  exit node, which is what keeps GVS media URLs usable for one download. A
+  mid-video exit change is still guarded by `continuedl: False` (restart the
+  video, never resume a `.part` from a different exit).
+- Discovery stays direct (RSS feed GETs and channel-ID GETs are not the bot-
+  defended surface); the Tor lane is for the InnerTube/download side.
+- `force_ipv4` shapes yt-dlp's own name resolution, not Tor's routing.
+
+### What to watch
+
+- Settings card gains a Tor block and the egress line now reads
+  `Routing via Tor exit socks5h://…` while that lane is live.
+- First escalation logs `Tor lane ready at … (circuit still bootstrapping…)`;
+  the first video of that cycle may burn an yt-dlp retry or two while tor
+  finishes fetching relay descriptors.
+- If you see `Tor lane failed repeatedly; retiring it and using direct egress`,
+  the exit node is dead or flagged — that is the tier working as designed, not
+  a fault to chase.
 

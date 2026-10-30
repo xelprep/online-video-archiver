@@ -8,9 +8,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # minimum (v22), so we install deno instead. Deno is yt-dlp's default runtime,
 # so no extra option is required in the code. (unzip is needed by the installer.)
 # tzdata backs Python's zoneinfo so the app can schedule refreshes in IANA
-# timezones (without it, zoneinfo silently falls back to UTC).
+# timezones (without it, zoneinfo silently falls back to UTC). tor is the opt-in
+# escape-hatch egress lane (docs/anti-bot-egress.md): the app only starts it once
+# direct egress is bot-blocked, and tor keeps its state under DATA_DIR, so the
+# image pays for the binary alone.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq tzdata \
+    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq tzdata tor \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
 

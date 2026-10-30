@@ -228,6 +228,23 @@ back to its own IP immediately.
 > throttled, not a high-reliability egress. If you have your own residential
 > or VPN exit IPs, a static proxy or VPN is a more robust option.
 
+### Tor fallback (off by default)
+
+A second escape hatch for a bot-blocked IP: `Enable Tor` routes the download
+through a Tor exit node instead of a public SOCKS5 pool. It is reactive like the
+pool (nothing touches Tor until the direct connection is actually blocked) and
+the same recovery probe drops back to direct once you are throttled no more.
+`Which egress first` picks the escalation order — **proxy pool first** by
+default, since both tiers are public infrastructure but the pool is re-vetted
+per cycle, rotatable and already warm, while Tor is one fixed exit with a cold
+bootstrap. `tor_socks_url` can point at a Tor you run yourself (a peer container
+or a host daemon); blank means the image's own tor, started on demand.
+
+Tor exits are public IPs that Google may already have blocklisted and that
+thousands of other users share, so this is a last resort, not a better egress.
+Full ordering, the daemon-start mechanics, and the limits:
+**[docs/anti-bot-egress.md](docs/anti-bot-egress.md) § 5**.
+
 ## Notes
 
 - The HTTP server binds to `0.0.0.0` inside the container, so it is reachable from your

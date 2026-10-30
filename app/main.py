@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.13.9"
+APP_VERSION = "1.14.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -244,6 +244,34 @@ PROXY_THOROUGH_TIMEOUT = 25
 # a full re-sweep on every failed download.
 PROXY_VET_COOLDOWN = 300
 
+# ---------------------------------------------------------------------------
+# Phase 5 - Tor as an escape-hatch egress lane. Same reactive shape as the
+# SOCKS pool: nothing touches Tor until the direct egress is already bot-blocked.
+# Tor exit nodes are PUBLIC infrastructure (Google keeps blocklists of known
+# exit IPs, and one exit serves thousands of users), so Tor sits BELOW the
+# vetted pool in the escalation order by default: the pool is re-vetted per
+# cycle, rotatable, and already warm when escalation happens, while Tor is a
+# single fixed exit node with a cold bootstrap and nothing to rotate through.
+# Both tiers are last-resort relative to private egress; docs/anti-bot-egress.md
+# carries the ordering rationale and the measured exit-node behaviour.
+# ---------------------------------------------------------------------------
+TOR_SOCKS_DEFAULT = os.getenv("TOR_SOCKS_URL", "socks5h://127.0.0.1:9050")
+# Only SOCKS endpoints are accepted: a typo in the setting must never silently
+# turn the Tor lane into a direct (unmasked) connection.
+TOR_SOCKS_RE = re.compile(r"^(socks5[h]?)://([A-Za-z0-9._-]+):([1-9][0-9]{0,4})$")
+TOR_PRIORITIES = ("proxy_first", "tor_first")
+# tor's private data directory is $HOME/.tor by default and the container's
+# HOME is not writable by appuser, so the app starts tor with HOME here.
+TOR_DATA_DIR = DATA_DIR / "tor"
+# tor opens its SOCKS listener almost immediately but needs ~10 s of onionroot/
+# relay fetches before it can build a clearnet circuit: poll for the listener,
+# and the first requests of the cycle ride yt-dlp's own retries.
+TOR_START_TRIES = 24
+TOR_START_POLL = 1.0
+# Tor has no pool to rotate, so repeated failures on the one exit retire the
+# lane rather than grinding it for the rest of the cycle.
+TOR_MAX_CONSECUTIVE = 2
+
 app = Flask(__name__)
 app.config.update(
     # Derived from the password so sessions survive restarts, and changing the
@@ -371,6 +399,13 @@ def seed_settings():
         "proxy_vet_limit": "300",
         "proxy_recovery_probe_every": "10",
         "proxy_max_rotations": "5",
+        # Phase 5: Tor escape hatch (docs/anti-bot-egress.md). Off by default;
+        # like the pool it only engages once direct egress is bot-blocked.
+        # tor_socks_url may point at a tor instance you run yourself (a peer
+        # container on the compose network, or a host tor daemon).
+        "tor_enabled": "0",
+        "tor_socks_url": TOR_SOCKS_DEFAULT,
+        "tor_priority": "proxy_first",
     }
     with db() as conn:
         for key, value in defaults.items():
@@ -891,6 +926,11 @@ def get_settings():
         "proxy_vet_limit": proxy_vet_limit,
         "proxy_recovery_probe_every": proxy_recovery_probe_every,
         "proxy_max_rotations": proxy_max_rotations,
+        # Phase 5: Tor lane (docs/anti-bot-egress.md).
+        "tor_enabled": get_setting("tor_enabled", "0") == "1",
+        "tor_socks_url": get_setting("tor_socks_url", "") or TOR_SOCKS_DEFAULT,
+        "tor_priority": (get_setting("tor_priority", "proxy_first")
+                         or "proxy_first").lower(),
     }
 
 
@@ -959,52 +999,90 @@ class EgressManager:
     connect, then a real extract+download). We probe the direct connection
     periodically and drop back to DIRECT once the local IP is no longer
     throttled. See dev/PLANNING-antidetect.md for the design and spike results.
+
+    TOR: route through a Tor SOCKS5 endpoint instead (the image's own tor,
+    started on demand, or one the user runs and points `tor_socks_url` at).
+    Tor exits are public infrastructure exactly like the pool, so they sit
+    BELOW it in the escalation order by default: the pool is re-vetted per
+    cycle, rotatable and already warm at escalation time, while Tor is one
+    fixed exit with a cold bootstrap and no pool to rotate through. Both
+    tiers stay last-resort relative to private egress; the ordering and the
+    measured exit-node behaviour live in docs/anti-bot-egress.md.
     """
 
     DIRECT = "direct"
     PROXY = "proxy"
+    TOR = "tor"
 
     def __init__(self):
         self._lock = threading.Lock()
+        # tor bring-up (subprocess + polls) must not stall current_proxy() for
+        # in-flight downloads, so it uses its own lock rather than _lock.
+        self._tor_lock = threading.Lock()
         self._state = self.DIRECT
         self._pool = []            # [{"ip","port","country","failures"}]
         self._index = 0
         self._consecutive_rotations = 0
         self._downloads_since_probe = 0
         self._last_vet_at = 0.0
+        self._tor_proc = None      # tor daemon this manager started (None = not ours)
+        self._tor_url = None       # Tor SOCKS endpoint while the TOR state runs
+        self._tor_failures = 0
 
     # -- egress decision ---------------------------------------------------
     def current_proxy(self):
-        # None => connect directly. A "socks5h://ip:port" URL routes through the
-        # active proxy (socks5h = remote DNS, for clean IP masking).
+        # None => connect directly. A "socks5h://..." URL routes through the
+        # active escalation lane: a vetted public SOCKS5 proxy from the pool, or
+        # the Tor endpoint while the TOR state runs (socks5h = the exit node
+        # resolves the target name, which is what masks our own IP).
         with self._lock:
+            if self._state == self.TOR:
+                return self._tor_url
             if self._state != self.PROXY or not self._pool:
                 return None
             entry = self._pool[self._index % len(self._pool)]
             return f"socks5h://{entry['ip']}:{entry['port']}"
 
     def on_rate_limited(self):
-        # React to a YouTube rate-limit. Returns "proxy" if a proxy is now
-        # active (the caller should retry the operation), else "none" (the
-        # caller applies the abort/backoff policy).
-        if not self._proxy_enabled():
+        # React to a YouTube rate-limit / bot-detection signal. Returns the
+        # name of the lane now active ("proxy"/"tor", the caller retries the
+        # operation through it), or "none" (the caller applies abort/backoff).
+        tiers = self._tiers()
+        if not tiers:
             return "none"
+        # tor bring-up spawns a process and polls, so it runs BEFORE the state
+        # lock is taken: holding _lock across a tor start would stall current
+        # proxy() for every in-flight download.
+        tor_url = self.ensure_tor() if self.TOR in tiers else None
         with self._lock:
             if self._state == self.DIRECT:
-                # Reactive trigger: reuse a recent persisted pool if we have
-                # one, otherwise build a fresh one.
-                pool = self._load_pool()
-                if not pool:
-                    pool = self._vet_sweep()
-                    if pool:
-                        self._save_pool()
-                if not pool:
-                    return "none"
-                self._pool = pool
-                self._index = 0
-                self._state = self.PROXY
-                self._consecutive_rotations = 0
-                return "proxy"
+                # Reactive trigger: walk the enabled lanes in escalation order
+                # and take the first that can actually serve a request.
+                for tier in tiers:
+                    if tier == self.PROXY:
+                        pool = self._load_pool()
+                        if not pool:
+                            pool = self._vet_sweep()
+                            if pool:
+                                self._save_pool()
+                        if not pool:
+                            continue
+                        self._pool = pool
+                        self._index = 0
+                        self._state = self.PROXY
+                        self._consecutive_rotations = 0
+                        return self.PROXY
+                    if tier == self.TOR and tor_url:
+                        self._state = self.TOR
+                        self._tor_url = tor_url
+                        self._tor_failures = 0
+                        return self.TOR
+                return "none"
+            if self._state == self.TOR:
+                # One fixed exit has already been asked; nothing weaker to
+                # escalate to. on_proxy_failed retires the lane after TOR_MAX
+                # CONSECUTIVE signals so the pool gets re-vetted instead.
+                return "none"
             # PROXY: rotate to the next proxy; re-vet once every proxy in the
             # pool has been tried.
             if not self._pool:
@@ -1012,6 +1090,12 @@ class EgressManager:
             self._rotate()
             self._consecutive_rotations += 1
             if self._consecutive_rotations >= len(self._pool):
+                if self.TOR in tiers and tor_url:
+                    self._state = self.TOR
+                    self._tor_url = tor_url
+                    self._tor_failures = 0
+                    log.info("Proxy pool exhausted; escalating to the Tor lane")
+                    return self.TOR
                 pool = self._vet_sweep()
                 if not pool:
                     return "none"
@@ -1019,26 +1103,44 @@ class EgressManager:
                 self._index = 0
                 self._consecutive_rotations = 0
                 self._save_pool()
-            return "proxy"
+            return self.PROXY
 
     def on_proxy_failed(self):
-        # A proxy error (not a rate-limit): mark the current proxy failed and
-        # rotate to the next one.
+        # A lane-transport error (not a YouTube signal): mark the current proxy
+        # failed and rotate to the next one. Tor has nothing to rotate, so
+        # repeated failures retire the lane and egress falls back to direct -
+        # the next signal then re-walks the tier order (pool re-vet, tor reuse).
+        retired = None
         with self._lock:
+            if self._state == self.TOR:
+                self._tor_failures += 1
+                if self._tor_failures >= TOR_MAX_CONSECUTIVE:
+                    self._state = self.DIRECT
+                    self._tor_url = None
+                    self._tor_failures = 0
+                    retired, self._tor_proc = self._tor_proc, None
+                return
             if self._state != self.PROXY or not self._pool:
                 return
             entry = self._pool[self._index % len(self._pool)]
             entry["failures"] = entry.get("failures", 0) + 1
             self._rotate()
+        if retired:
+            retired.terminate()
+            log.warning("Tor lane failed repeatedly; retiring it and using direct egress")
 
     def on_success(self):
         # Record a success. Periodically probe the direct connection; if the
-        # local IP is no longer throttled, drop back to DIRECT egress.
+        # local IP is no longer throttled, drop back to DIRECT egress. From
+        # either escalated lane: a tor daemon we started is left running (a few
+        # tens of MB, but the next escalation gets a warm circuit); reset() or
+        # turning Tor off stops it.
         probe = False
         with self._lock:
             self._consecutive_rotations = 0
+            self._tor_failures = 0
             self._downloads_since_probe += 1
-            if self._state == self.PROXY and self._downloads_since_probe >= self._probe_every():
+            if self._state != self.DIRECT and self._downloads_since_probe >= self._probe_every():
                 self._downloads_since_probe = 0
                 probe = True
         if probe and self._probe_direct():
@@ -1048,34 +1150,155 @@ class EgressManager:
                 self._index = 0
                 self._consecutive_rotations = 0
                 self._downloads_since_probe = 0
+                self._tor_url = None
             self._clear_pool()
-            log.info("Direct egress recovered; leaving proxy mode")
+            log.info("Direct egress recovered; leaving escalated egress")
 
     def reset(self):
-        # Force direct egress and clear the pool (user-initiated).
+        # Force direct egress, clear the pool and stop our own tor daemon
+        # (user-initiated: they asked to stop using escalated egress). A tor
+        # instance the user runs outside the app is left alone.
         with self._lock:
             self._state = self.DIRECT
             self._pool = []
             self._index = 0
             self._consecutive_rotations = 0
             self._downloads_since_probe = 0
+            self._tor_failures = 0
+            self._tor_url = None
+            retired, self._tor_proc = self._tor_proc, None
+        if retired:
+            retired.terminate()
+            log.info("Stopped the tor daemon this manager started")
         self._clear_pool()
         log.info("Egress reset to direct")
 
     def status(self):
+        # `current_proxy` carries the Tor endpoint too while the TOR state runs,
+        # so the Settings card has one honest "what IP am I leaving from" line.
         with self._lock:
             current = None
             if self._state == self.PROXY and self._pool:
                 e = self._pool[self._index % len(self._pool)]
                 current = f"{e['ip']}:{e['port']}"
+            elif self._state == self.TOR:
+                current = self._tor_url
             return {
-                "enabled": self._proxy_enabled(),
+                "enabled": self._proxy_enabled() or self._tor_enabled(),
                 "state": self._state,
                 "pool_size": len(self._pool),
                 "current_proxy": current,
                 "consecutive_rotations": self._consecutive_rotations,
                 "last_vet_at": self._last_vet_at or None,
+                "tor_enabled": self._tor_enabled(),
+                "tor_priority": (get_setting("tor_priority", "proxy_first")
+                                 or "proxy_first").lower(),
+                "tor_endpoint": self._tor_url,
+                "tor_running": self._tor_proc is not None,
             }
+
+    # -- escalation lanes --------------------------------------------------
+    def _tiers(self):
+        # Which lanes a bot-block steps through, in order. Default: the vetted
+        # SOCKS pool, then Tor - the pool is re-vetted per cycle, rotatable and
+        # already warm, while Tor is one fixed exit with a cold bootstrap
+        # (docs/anti-bot-egress.md). "tor_first" inverts it for deploy
+        # networks where public SOCKS pools are dead but Tor reaches YouTube.
+        order = [self.PROXY, self.TOR]
+        if ((get_setting("tor_priority", "proxy_first") or "").strip().lower()
+                == "tor_first"):
+            order = [self.TOR, self.PROXY]
+        return [tier for tier in order if self._lane_enabled(tier)]
+
+    def _lane_enabled(self, tier):
+        return self._proxy_enabled() if tier == self.PROXY else self._tor_enabled()
+
+    # -- tor lane ----------------------------------------------------------
+    def _tor_enabled(self):
+        return get_setting("tor_enabled", "0") == "1"
+
+    def _tor_endpoint(self):
+        # (url, host, port) for the configured SOCKS endpoint, or None when it
+        # is malformed - a bad URL must never mean "go direct".
+        raw = (get_setting("tor_socks_url", "") or "").strip() or TOR_SOCKS_DEFAULT
+        m = TOR_SOCKS_RE.match(raw)
+        if not m:
+            return None
+        return raw, m.group(2), int(m.group(3))
+
+    def _tor_listening(self, host, port):
+        # Cheap "is the lane there" test: Tor answers a bare TCP connect on its
+        # SOCKS port, and no YouTube traffic is involved either way.
+        try:
+            with socket.socket() as probe:
+                probe.settimeout(2)
+                probe.connect((host, port))
+            return True
+        except OSError:
+            return False
+
+    def ensure_tor(self):
+        """Return the Tor SOCKS URL when the lane is usable, else None.
+
+        An endpoint something else already runs (a tor peer container on the
+        compose network, a tor daemon on the NAS host) is used as-is when it is
+        reachable. Otherwise the image's tor is started. tor keeps its state in
+        $HOME/.tor by default and the container's HOME is not writable by the
+        unprivileged app user, so HOME is redirected into DATA_DIR. tor 0.4.9
+        rejects a custom torrc's option spellings ("Unknown option"), which is
+        why the daemon is started with its built-in defaults.
+        """
+        if not self._tor_enabled():
+            # Turning Tor off also stops a daemon this manager started.
+            with self._lock:
+                stale, self._tor_proc = self._tor_proc, None
+            if stale:
+                stale.terminate()
+            return None
+        parsed = self._tor_endpoint()
+        if parsed is None:
+            log.warning("tor_socks_url is not a socks5 endpoint; Tor lane disabled")
+            return None
+        url, host, port = parsed
+        if self._tor_listening(host, port):
+            return url
+        if not shutil.which("tor"):
+            log.warning("Tor lane enabled but tor is not in the image: add it to the "
+                        "Dockerfile apt line, or point tor_socks_url at a tor you run "
+                        "yourself")
+            return None
+        with self._tor_lock:
+            if self._tor_proc is not None:
+                # A previous start stopped answering; retire it before relaunch.
+                self._tor_proc.terminate()
+                self._tor_proc = None
+            try:
+                TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.warning("Cannot prepare tor data dir %s: %s", TOR_DATA_DIR, exc)
+                return None
+            env = dict(os.environ)
+            env["HOME"] = str(TOR_DATA_DIR)
+            try:
+                proc = subprocess.Popen(["tor"], env=env)
+            except OSError as exc:
+                log.warning("Could not start tor: %s", exc)
+                return None
+            with self._lock:
+                self._tor_proc = proc
+            for _ in range(TOR_START_TRIES):
+                if self._tor_listening(host, port):
+                    log.info("Tor lane ready at %s (circuit still bootstrapping; "
+                             "the first requests of the cycle ride yt-dlp's retries)",
+                             url)
+                    return url
+                time.sleep(TOR_START_POLL)
+            log.warning("tor never opened its SOCKS listener on %s:%d; Tor lane disabled",
+                        host, port)
+            with self._lock:
+                stale, self._tor_proc = proc, None
+            stale.terminate()
+            return None
 
     # -- internals ---------------------------------------------------------
     def _rotate(self):
@@ -1387,8 +1610,10 @@ def ydl_opts(download=False, outtmpl=None):
     # yt-dlp emits all of this at DEBUG; the "verbose yt-dlp" toggle (see
     # apply_ydl_log_setting) raises ydl_logger to DEBUG to reveal it.
     opts["logger"] = ydl_logger_proxy
-    # Phase 4: route through a proxy when the egress manager has one active.
-    # (No-op until Phase 4 lands; current_proxy() returns None today.)
+    # Phase 4/5: route through whichever escalation lane is active - a vetted
+    # public SOCKS5 proxy, or the Tor endpoint. yt-dlp's YouTube extractor also
+    # hands this proxy to the POT provider (request_proxy -> the bgutil server's
+    # `proxy` field), so tokens mint through the same exit that will use them.
     proxy = egress_manager.current_proxy()
     if proxy:
         opts["proxy"] = proxy
@@ -2103,9 +2328,11 @@ def _handle_rate_limit(context, channel_url, exc, consecutive=1):
         context, channel_url, exc,
     )
     _notify_rate_limited(context, channel_url, exc)
-    # Phase 4: let the egress manager rotate to a fresh IP if it is active.
-    if egress_manager.on_rate_limited() == "proxy":
-        log.info("Egress rotated to a proxy; retrying %s", context)
+    # Escalate egress: the manager walks the enabled lanes in order (pool
+    # rotation, then Tor) and reports which one is now active.
+    lane = egress_manager.on_rate_limited()
+    if lane != "none":
+        log.info("Egress escalated to %s; retrying %s", lane, context)
         return "retry"
     if action == "backoff":
         try:
@@ -3244,6 +3471,22 @@ def api_update_settings():
             errors["proxy_max_rotations"] = "must be >= 0"
         if pmr is not None:
             set_setting("proxy_max_rotations", pmr)
+    # Phase 5: Tor lane.
+    if "tor_enabled" in data:
+        set_setting("tor_enabled", "1" if data["tor_enabled"] else "0")
+    if "tor_priority" in data:
+        priority = str(data["tor_priority"]).strip().lower()
+        if priority not in TOR_PRIORITIES:
+            errors["tor_priority"] = "must be one of: " + ", ".join(TOR_PRIORITIES)
+        else:
+            set_setting("tor_priority", priority)
+    if "tor_socks_url" in data:
+        socks = str(data["tor_socks_url"] or "").strip()
+        if socks and not TOR_SOCKS_RE.match(socks):
+            errors["tor_socks_url"] = ('must look like "socks5h://host:port" '
+                                       '(or leave it blank for the default)')
+        else:
+            set_setting("tor_socks_url", socks)
     if errors:
         return jsonify({"error": errors}), 400
     return jsonify(get_settings())
