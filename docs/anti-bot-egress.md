@@ -203,7 +203,11 @@ tried once Tor has been used and comes back exhausted.
   the container's HOME is not writable by the unprivileged `appuser`, so HOME
   is pointed at `DATA_DIR/tor`. Verified in the deploy image: tor started as
   `appuser` with that HOME opens `127.0.0.1:9050`; started without it, tor dies
-  with "Couldn't create private data directory".
+  with "Couldn't create private data directory". That address stops being
+  accurate once the torrc line in the last section below lands — tor then
+  opens `0.0.0.0:9051` and `127.0.0.1:9050` does not exist, because a
+  `SocksPort` line supersedes the built-in default. Read the last section
+  as the current state and this bullet as the pre-change state.
 - The daemon is left running until you press **Reset to direct** or turn Tor
   off, so the next escalation gets a warm circuit.
 
@@ -246,3 +250,41 @@ tried once Tor has been used and comes back exhausted.
   the exit node is dead or flagged — that is the tier working as designed, not
   a fault to chase.
 
+### One shared socket, both containers
+
+The image binds tor's SOCKS socket to `0.0.0.0:9051` (the `SocksPort` line the
+Dockerfile appends to the packaged `/etc/tor/torrc` — the file the app's `Popen(["tor"])`
+reads). That is what lets the `bgutil-pot` peer container mint through the SAME
+exit node the app is downloading through, instead of the peer minting on the
+container IP and the token being spent from an exit node. One listener, no third
+container. Two consequences of that line, both measured against the real image:
+
+- A `SocksPort` line SUPERSEDES tor's built-in default, so `127.0.0.1:9050` no
+  longer exists once the image carries one (`connect ECONNREFUSED`). The default
+  `tor_socks_url` must therefore be raised to the container-name form
+  `socks5h://<archiver-container-name>:9051` — in the settings UI, or with
+  `-e TOR_SOCKS_URL=…` when the archiver container is created. One value feeds
+  both sides: yt-dlp's `request_proxy` and the `/get_pot` body's `proxy` field,
+  so the endpoint has to be reachable from *both* containers.
+- Loopback is per container, never per network: a peer reaches the socket through
+  the app container's *network name*, not `127.0.0.1` — inside the app container
+  `/etc/hosts` lists only the container id, and name/alias resolution comes from
+  the network's own hosts file, which only that network's containers consult.
+  Pin a stable handle with `--network-alias` on the archiver container and use
+  that in the setting, so a Container Manager rename cannot silently break the
+  lane (the app's own `_tor_listening` probe resolves the same name, which is
+  why the same value works on both sides).
+
+Healthy escalation logs `Tor lane ready at socks5h://<name>:9051`. A dead
+endpoint logs `tor never opened its SOCKS listener` / `Tor lane disabled` (name
+or alias no longer resolves: rename, or container recreated without the alias).
+On the POT side a dead endpoint is `Could not get BotGuard challenge … connect
+ECONNREFUSED <peer network ip>:9051`, which yt-dlp surfaces as
+`PoTokenProviderError` and the download then runs token-less.
+
+Wildcard binding is exposure, not formality: with no host port published the
+socket still answers from the NAS host at the container network IP
+(`curl --socks5-hostname <net-ip>:9051` leaves through a Tor node). If the NAS
+must not gain an open Tor proxy, restrict entry at the socket (the packaged
+torrc carries `#SocksPolicy` lines — spelling on tor 0.4.9.x not re-verified
+here) or keep tor in its own peer container instead.

@@ -15,7 +15,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl unzip dnsmasq tzdata tor \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh \
+    && printf '\n# bind the SOCKS socket to all interfaces so the bgutil-pot peer container,\n# on the shared docker network, can mint through the SAME exit node the app is\n# routing through (docs/anti-bot-egress.md). 9051 leaves tor built-in default\n# (9050) unused; any SocksPort line supersedes that default, so tor_socks_url\n# must name the archiver container: socks5h://<archiver>:9051.\nSocksPort 0.0.0.0:9051\n' >> /etc/tor/torrc
 
 WORKDIR /app
 COPY requirements.txt .
