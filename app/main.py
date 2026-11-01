@@ -255,7 +255,12 @@ PROXY_VET_COOLDOWN = 300
 # Both tiers are last-resort relative to private egress; docs/anti-bot-egress.md
 # carries the ordering rationale and the measured exit-node behaviour.
 # ---------------------------------------------------------------------------
-TOR_SOCKS_DEFAULT = os.getenv("TOR_SOCKS_URL", "socks5h://127.0.0.1:9050")
+# tor's OWN built-in SOCKS endpoint, kept as a named constant because it is
+# also what seed_settings() bakes into archive.db when TOR_SOCKS_URL is unset:
+# once a DB has booted, a stored value equal to it is indistinguishable from
+# "never chosen", and tor_endpoint() below uses exactly that fact.
+TOR_SOCKS_BUILTIN = "socks5h://127.0.0.1:9050"
+TOR_SOCKS_DEFAULT = os.getenv("TOR_SOCKS_URL", TOR_SOCKS_BUILTIN)
 # Only SOCKS endpoints are accepted: a typo in the setting must never silently
 # turn the Tor lane into a direct (unmasked) connection.
 TOR_SOCKS_RE = re.compile(r"^(socks5[h]?)://([A-Za-z0-9._-]+):([1-9][0-9]{0,4})$")
@@ -410,6 +415,24 @@ def seed_settings():
     with db() as conn:
         for key, value in defaults.items():
             conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def tor_endpoint():
+    """The Tor SOCKS endpoint in effect, deploy-time env included.
+
+    seed_settings() writes defaults INSERT OR IGNORE, so the first boot of a
+    deploy bakes an endpoint into archive.db and a later rebuild that sets
+    TOR_SOCKS_URL in compose/docker-run would otherwise be ignored forever -
+    the settings-UI edit users end up having to make. A stored value still
+    equal to tor's own built-in endpoint is indistinguishable from "never
+    chosen", so the env replaces exactly that value; any endpoint the user
+    saved in the UI keeps winning over it.
+
+    """
+    stored = (get_setting("tor_socks_url", "") or "").strip()
+    if stored and stored != TOR_SOCKS_BUILTIN:
+        return stored
+    return TOR_SOCKS_DEFAULT
 
 
 def is_paused():
@@ -928,7 +951,7 @@ def get_settings():
         "proxy_max_rotations": proxy_max_rotations,
         # Phase 5: Tor lane (docs/anti-bot-egress.md).
         "tor_enabled": get_setting("tor_enabled", "0") == "1",
-        "tor_socks_url": get_setting("tor_socks_url", "") or TOR_SOCKS_DEFAULT,
+        "tor_socks_url": tor_endpoint(),
         "tor_priority": (get_setting("tor_priority", "proxy_first")
                          or "proxy_first").lower(),
     }
@@ -1220,7 +1243,7 @@ class EgressManager:
     def _tor_endpoint(self):
         # (url, host, port) for the configured SOCKS endpoint, or None when it
         # is malformed - a bad URL must never mean "go direct".
-        raw = (get_setting("tor_socks_url", "") or "").strip() or TOR_SOCKS_DEFAULT
+        raw = tor_endpoint()
         m = TOR_SOCKS_RE.match(raw)
         if not m:
             return None

@@ -257,7 +257,7 @@ Dockerfile appends to the packaged `/etc/tor/torrc` — the file the app's `Pope
 reads). That is what lets the `bgutil-pot` peer container mint through the SAME
 exit node the app is downloading through, instead of the peer minting on the
 container IP and the token being spent from an exit node. One listener, no third
-container. Two consequences of that line, both measured against the real image:
+container. Three things that line implies, all measured against the real image:
 
 - A `SocksPort` line SUPERSEDES tor's built-in default, so `127.0.0.1:9050` no
   longer exists once the image carries one (`connect ECONNREFUSED`). The default
@@ -274,6 +274,16 @@ container. Two consequences of that line, both measured against the real image:
   that in the setting, so a Container Manager rename cannot silently break the
   lane (the app's own `_tor_listening` probe resolves the same name, which is
   why the same value works on both sides).
+- Seeding is per key, once: `seed_settings()` writes defaults with
+  `INSERT OR IGNORE`, so the first boot of a deploy bakes an endpoint into
+  `archive.db`, and a rebuild that sets `-e TOR_SOCKS_URL=…` alone would not
+  reach an instance that booted before. `tor_endpoint()` closes that gap: a
+  stored value still equal to tor's built-in `127.0.0.1:9050` counts as
+  "never chosen" and the env replaces it, so a compose or docker-run deploy
+  keeps its endpoint across rebuilds without anyone reopening the settings UI.
+  Any endpoint you actually saved in the UI keeps winning over the env; the
+  one endpoint you cannot pin while an env names another is that built-in
+  default itself.
 
 Healthy escalation logs `Tor lane ready at socks5h://<name>:9051`. A dead
 endpoint logs `tor never opened its SOCKS listener` / `Tor lane disabled` (name

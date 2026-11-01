@@ -18,6 +18,23 @@ services:
       # peer lookup. Overriding this to a host:port only makes sense if you
       # run the provider image yourself outside compose.
       POT_SERVER_URL: "http://bgutil-pot:4416"
+      # Tor lane endpoint — see docs/anti-bot-egress.md ("One shared socket,
+      # both containers"). The image binds tor's SOCKS socket to all interfaces
+      # at 9051 (the torrc line the Dockerfile appends), so this container and
+      # the bgutil-pot peer below share ONE socket: the peer mints through the
+      # SAME exit node this container downloads through, instead of minting on
+      # its own container IP and spending the token from a different exit. The
+      # host must be container_name above — a peer never reaches a socket
+      # through 127.0.0.1, it reaches it by name over the compose network, and
+      # tor's built-in 127.0.0.1:9050 stops existing once the image carries a
+      # SocksPort line. If you rename the container, rename this too. The
+      # socket only listens while the Tor lane is live; until then this value
+      # is inert and egress stays direct/pool. Seeding is INSERT OR IGNORE per
+      # key (app/main.py seed_settings), so this value reaches a container over
+      # a FRESH archive.db; over a redeploy that booted before, the stored
+      # endpoint wins and must be corrected in the settings UI (or delete the
+      # key from archive.db).
+      TOR_SOCKS_URL: "socks5h://online-video-archiver:9051"
       # Optional: pin the DNS cache's upstream resolver (e.g. "1.1.1.1" for
       # Cloudflare's DoH-on-resolver endpoint) to bypass the host chain
       # for this container. Unset = discover whatever upstream
