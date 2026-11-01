@@ -298,3 +298,55 @@ socket still answers from the NAS host at the container network IP
 must not gain an open Tor proxy, restrict entry at the socket (the packaged
 torrc carries `#SocksPolicy` lines — spelling on tor 0.4.9.x not re-verified
 here) or keep tor in its own peer container instead.
+
+## PO Token visitor_data must ride EVERY lane (verified 2026-11-01)
+
+Symptom class (one NAS log, one video, nothing else failing):
+
+```
+WARNING [youtube] <id>: Unable to download webpage: HTTP Error 429: Too Many Requests
+WARNING [youtube] <id>: Unable to download API page: HTTP Error 403: Forbidden
+DEBUG  [youtube] <id>: Downloading tv samsung player API JSON   (and visionos / web)
+WARNING [youtube] Unable to fetch GVS PO Token for web client: Missing required
+         Visitor Data. You may need to pass Visitor Data with --extractor-args
+         "youtube:visitor_data=XXX"
+```
+
+while the bgutil peer logs nothing at all. That is not a dead provider: the
+gate in `yt_dlp/extractor/youtube/_video.py` runs before the provider is ever
+consulted, and its only inputs are (a) did the extractor get a `visitor_data`
+value and (b) does the client advertise the `html5_generate_content_po_token`
+experiment (which binds the GVS token to the video ID instead of to the
+visitor). A bot-walled egress fails (a): the watch-page GET that yt-dlp scrapes
+`visitorData` from is the very request that 429s/403s, so nothing is scraped.
+
+The app's own `youtube:visitor_data` extractor arg used to be attached only to
+the `download=True` lane. It belongs on EVERY lane, because the token is minted
+by whichever YoutubeDL instance does the EXTRACTION — here the `download=False`
+lane (`get_full_info`) — and the info-JSON round trip to the download lane
+cannot carry that lane's token-fetch closure (a `functools.partial` bound to
+the extractor instance) across. yt-dlp reads the arg back before any scrape
+(`yt_dlp/extractor/youtube/_base.py`: `_extract_visitor_data` consults the
+`youtube:visitor_data` extractor arg first), and the POT framework hands it to
+the provider as the GVS content binding (`yt_dlp/extractor/youtube/pot/utils.py`:
+`_extract_visitor_id(request.visitor_data)` → `ContentBindingType.VISITOR_DATA`).
+
+Measured against the deployed image with the watch-page scrape forced to answer
+nothing (the bot-walled shape) and the experiment flag stripped from the ytcfg
+so the gate — not the sandbox's own video-ID binding — is what runs:
+
+| tree | GVS token calls | with a visitor value | "Missing required Visitor Data" | provider `/get_pot` calls |
+|---|---|---|---|---|
+| arg on the download lane only (before) | 34 | 0 | 1 | 0 |
+| arg on every lane (after) | 34 | 34 | 0 | 0 |
+
+Both counts are probe measurements, not inferences. The last column stayed 0 in
+both runs because the stripped ytcfg also marks the GVS token as not required
+for that client, so no mint is attempted; end-to-end minting could not be
+verified from sandbox egress at all (sandbox is itself walled: the before-run
+ended `Sign in to confirm you're not a bot` with 0 formats, the after-run
+extracted title + 54 formats). Treat "the extractor is finally handed a visitor
+value on its own lane" as the verified half; a live mint on the NAS is the
+acceptance check, and its fingerprint is unchanged: a `Generating a gvs PO
+Token … via bgutil HTTP server` line in the app log plus `/get_pot` hits in the
+bgutil peer's log.

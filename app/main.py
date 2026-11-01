@@ -1614,16 +1614,34 @@ def ydl_opts(download=False, outtmpl=None):
         opts["extractor_args"] = {
             "youtubepot-bgutilhttp": {"base_url": [POT_SERVER_DEFAULT]}
         }
-        if download:
-            vd = get_cached_visitor_data()
-            if not vd:
-                try:
-                    vd = learn_visitor_data()
-                except Exception as exc:
-                    log.debug("visitor_data learn failed: %s", exc)
-                    vd = None
-            if vd:
-                opts["extractor_args"]["youtube"] = {"visitor_data": [vd]}
+        # The GVS PO Token has to ride EVERY lane, not only the download one.
+        # yt-dlp fetches it while its extractor materialises a format's media
+        # URL — i.e. inside whichever YoutubeDL instance did the EXTRACTION. The
+        # app extracts in the download=False lane (get_full_info) and hands the
+        # download lane a dumped info JSON, which cannot carry the extractor's
+        # token-fetch closure (a functools.partial bound to that extractor
+        # instance) across the round trip. Attaching visitor_data to the
+        # download lane only therefore minted nothing: on a bot-walled egress
+        # yt-dlp's own watch-page scrape yields no visitorData (the webpage
+        # GET 429s and the initial-data call 403s) and the gate in
+        # yt_dlp/extractor/youtube/_video.py ("... and not visitor_data and not
+        # self.is_authenticated ...") reports
+        # "Unable to fetch GVS PO Token for <client> client: Missing required
+        # Visitor Data" and RETURNS WITHOUT CALLING THE PROVIDER — hence the
+        # bgutil peer staying silent while media then fails "Sign in to
+        # confirm you're not a bot". yt-dlp reads the arg back at
+        # yt_dlp/extractor/youtube/_base.py (_extract_visitor_data consults the
+        # `youtube:visitor_data` extractor arg before any response scrape), so
+        # the value survives the whole extraction.
+        vd = get_cached_visitor_data()
+        if not vd:
+            try:
+                vd = learn_visitor_data()
+            except Exception as exc:
+                log.debug("visitor_data learn failed: %s", exc)
+                vd = None
+        if vd:
+            opts["extractor_args"]["youtube"] = {"visitor_data": [vd]}
     # --force-ipv4 equivalent: resolve yt-dlp's targets over IPv4 records only.
     if get_setting("force_ipv4", "1") == "1":
         opts["force_ipv4"] = True
