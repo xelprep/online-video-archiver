@@ -121,20 +121,38 @@ fault; see yt-dlp issue #15392-class behavior and consider the cookies recipe be
 ## 2. force-ipv4 (default on)
 
 Your network leaks what it was built to avoid: the DNS chain
- can still hand back **AAAA (IPv6) records** for Google/YouTube hosts. 
-Anything that resolves to those records tries a transport with
-no working IPv6 path behind it — yt-dlp sits squarely in that class (that is why the
-pinned tracker #11868 prescribes `--force-ipv4` for IPv6-capable users).
+ can still hand back **AAAA (IPv6) records** — for Google/YouTube hosts *and*
+for whatever SMTP host the summary/error emails connect to, because `DNS_UPSTREAM`
+is domain-scoped to the YouTube family only. Anything that resolves to those
+records tries a transport with no working IPv6 path behind it — yt-dlp sits
+squarely in that class (that is why the pinned tracker #11868 prescribes
+`--force-ipv4` for IPv6-capable users), and so does smtplib.
 
-In `ydl_opts` we set the Python-API equivalent of that CLI flag:
+The app therefore forces IPv4 **once for the process**, not per layer:
+`apply_ipv4_only()` wraps `socket.getaddrinfo` to keep only AF_INET records,
+gated on the same setting. Every Python socket resolves through it — yt-dlp's
+networking helper (`yt_dlp/networking/_helper.py` asks `socket.getaddrinfo` itself)
+and everything the app opens: its feed / channel-page / Shorts / POT-ping GETs, the
+SOCKS readiness probe, and smtplib's email connect.
 
-```python
-if get_setting("force_ipv4", "1") == "1":
-    opts["force_ipv4"] = True
-```
+Two reasons that shape this design:
 
-This only touches **name resolution** (pick the IPv4 record, ignore the IPv6 one), so
-the download path is the one your infrastructure already serves correctly.
+- `-4/--force-ipv4` in the nightlies is
+  `action='store_const', const='0.0.0.0', dest='source_address'` (`yt_dlp/options.py`)
+  — **there is no key named `force_ipv4` anywhere in the package**, so an
+  `ydl_opts` entry with that spelling landed on `YoutubeDL` as an attribute nothing
+  reads: the layer had quietly stopped doing anything, which is why the leak kept
+  reaching the email path despite the setting reading "on".
+- `socket.create_connection()` connects to **every** record getaddrinfo returns and
+  re-raises the error of the **last** one. An IPv6 half the container cannot assign
+  fails with `EADDRNOTAVAIL` — errno 99, whose strerror is "Cannot assign
+  requested address" — so a mail failure used to log *that* line, naming no
+  address and no lane. Those failures now append what the chain returned
+  (`describe_smtp_names`), so the log line is actionable.
+
+The one surface this cannot reach is the curl_cffi impersonation lane, which
+resolves in C; those hosts are the YouTube family, pinned to `DNS_UPSTREAM`
+by the entrypoint.
 
 ## 3. The DNS-chain problem and its two fixes (and why the docs are the fix)
 

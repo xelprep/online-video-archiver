@@ -685,6 +685,82 @@ def apply_ydl_log_setting():
 
 
 # ---------------------------------------------------------------------------
+# IPv4-only name resolution (force_ipv4, docs/anti-bot-egress.md)
+# ---------------------------------------------------------------------------
+# Two facts shape this section.
+#
+# 1. `force_ipv4` is NOT a yt-dlp Python-API option. In the nightlies the CLI
+#    flag -4/--force-ipv4 (yt_dlp/options.py) is
+#    `action='store_const', const='0.0.0.0', dest='source_address'` - there is
+#    no key named force_ipv4 anywhere in the package, so an ydl_opts entry with
+#    that spelling landed on YoutubeDL as an attribute nothing reads: the layer
+#    was silently dead.
+# 2. socket.create_connection() asks getaddrinfo for EVERY record the chain
+#    returns (IPv4 and IPv6) and re-raises the error of the LAST one. This
+#    container has no IPv6 transport, so an IPv6 half fails with EADDRNOTAVAIL
+#    - errno 99, whose strerror is "Cannot assign requested address". That
+#    message is a property of the address family, not of the egress lane: it
+#    replaced the real IPv4 failure in the log line the user reads, and named
+#    no address at all.
+#
+# Forcing AF_INET once for the whole process is therefore both the fix for
+# yt-dlp's lanes (its networking helper asks socket.getaddrinfo, yt_dlp/networking/_helper.py:246, so it hits this switch too) and
+# the fix for everything the app opens itself: smtplib's summary/error-email
+# connect, the urllib feed + channel-page + Shorts-probe GETs, and the SOCKS
+# readiness probe. The one surface this cannot reach is the curl_cffi
+# impersonation lane, which resolves in C; those hosts are the YouTube family,
+# which the entrypoint pins to DNS_UPSTREAM.
+def apply_ipv4_only():
+    """Match name resolution for every socket in this process to force_ipv4.
+
+    Installs (or removes, when the setting is off) a getaddrinfo wrapper that
+    keeps only IPv4 records. Idempotent in both directions, so startup and the
+    Settings-tab toggle can both call it.
+    """
+    if get_setting("force_ipv4", "1") != "1":
+        original = getattr(socket.getaddrinfo, "__wrapped__", None)
+        if original is not None:
+            socket.getaddrinfo = original
+            log.info("force_ipv4 off: sockets resolve over whatever records the chain gives")
+        return
+
+    if getattr(socket.getaddrinfo, "__archiver_ipv4_only__", False):
+        return  # already installed on this module attribute (sentinel)
+
+    real = socket.getaddrinfo
+
+    def ipv4_only(*args, **kwargs):
+        infos = real(*args, **kwargs)
+        v4 = [info for info in infos if info[0] == socket.AF_INET]
+        # A chain that offers no IPv4 record at all keeps its original answer:
+        # never worse than unpatched, and describe_smtp_names below says why.
+        return v4 or infos
+
+    ipv4_only.__wrapped__ = real
+    ipv4_only.__archiver_ipv4_only__ = True
+    socket.getaddrinfo = ipv4_only
+    log.info("force_ipv4 installed: every socket resolves over IPv4 records only")
+
+
+def describe_smtp_names(host, port):
+    # The records the chain hands back for an SMTP endpoint, plus the family we
+    # actually connect over, so a mail failure in the log names an address the
+    # user can act on rather than a family-masked errno. Reads through the
+    # wrapper's original so the IPv6 half of a leaky chain stays visible.
+    resolver = getattr(socket.getaddrinfo, "__wrapped__", socket.getaddrinfo)
+    try:
+        infos = resolver(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        return f"no record for {host}:{port}: {exc}"
+    if not infos:
+        return f"no record for {host}:{port}"
+    parts = []
+    for fam, _type, _proto, _canon, sockaddr in infos[:4]:
+        parts.append(f"{'ipv4' if fam == socket.AF_INET else 'ipv6'} {sockaddr[0]}:{sockaddr[1]}")
+    return f"{host}:{port} chain gave {'; '.join(parts)}"
+
+
+# ---------------------------------------------------------------------------
 # Error email (SMTP): report failures to the user by email. The app is meant to
 # run unattended, so a persistent failure should reach the user even when they
 # are not watching the logs. STARTTLS is supported (Gmail, port 587).
@@ -736,7 +812,11 @@ def send_email(subject, body):
             server.sendmail(sender, [recipient], msg.as_string())
         return True, "sent"
     except Exception as exc:
-        return False, str(exc)
+        # An errno-only mail failure is unactionable: EADDRNOTAVAIL ("Cannot
+        # assign requested address") names the address family the container
+        # cannot use, not the reason the send failed. Name the endpoint and
+        # the records the chain returned instead.
+        return False, f"{exc} ({describe_smtp_names(host, port)})"
 
 
 def report_error(context, exc, force=False):
@@ -1642,9 +1722,11 @@ def ydl_opts(download=False, outtmpl=None):
                 vd = None
         if vd:
             opts["extractor_args"]["youtube"] = {"visitor_data": [vd]}
-    # --force-ipv4 equivalent: resolve yt-dlp's targets over IPv4 records only.
-    if get_setting("force_ipv4", "1") == "1":
-        opts["force_ipv4"] = True
+    # No yt-dlp opts key here: the nightlies implement -4/--force-ipv4 as
+    # dest=source_address (yt_dlp/options.py), so a key literally named
+    # "force_ipv4" was an inert attribute on YoutubeDL. IPv4 forcing for
+    # yt-dlp's own sockets happens in apply_ipv4_only(), which wraps the
+    # process-wide getaddrinfo every yt-dlp layer resolves through.
     # Route yt-dlp's own output (status, format selection, download progress)
     # through the logging system so the web Logs tab can show it. Without a
     # logger, yt-dlp writes straight to stdout, which the log stream never sees.
@@ -3493,6 +3575,7 @@ def api_update_settings():
         set_setting("pot_provider", "1" if data["pot_provider"] else "0")
     if "force_ipv4" in data:
         set_setting("force_ipv4", "1" if data["force_ipv4"] else "0")
+        apply_ipv4_only()  # the socket-layer switch follows the toggle
     # Phase 4: SOCKS5 proxy rotation (see dev/PLANNING-antidetect.md).
     if "proxy_enabled" in data:
         set_setting("proxy_enabled", "1" if data["proxy_enabled"] else "0")
@@ -3861,6 +3944,10 @@ if __name__ == "__main__":
     apply_log_level()
     apply_http_log_setting()
     apply_ydl_log_setting()
+    # IPv4-only name resolution for the whole process (docs/anti-bot-egress.md
+    # "force-ipv4"): smtplib, the app's urllib/probe sockets and yt-dlp's
+    # Python networking layers all resolve through here.
+    apply_ipv4_only()
     # Ensure the newest yt-dlp nightly (and with it, the POT provider plugin
     # registry) BEFORE the worker and the HTTP server start: a manual on-demand
     # download on a paused, freshly-started container must not run on the older
