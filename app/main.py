@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -142,6 +142,22 @@ last_scheduled_run = None
 # which channels got new videos). In-memory on purpose, matching last_scheduled_run.
 last_cycle = None
 last_cycle_lock = threading.Lock()
+
+# --- Sync-worker survivability ---------------------------------------------
+# The worker runs as ONE daemon thread started exactly once at startup. An
+# exception that escapes its loop body therefore kills every future scheduled
+# cycle while the HTTP server keeps serving, and the Logs tab stays empty
+# because the traceback reaches only the process' stderr. So the loop body is
+# guarded (see worker()): a fault is logged through the app logger, counted,
+# and backed off; after this many consecutive failing ticks a CRITICAL line
+# names that cycles have stopped being scheduled.
+WORKER_FAULT_CRITICAL_AFTER = 6
+WORKER_FAULT_SLEEP_BASE = 15
+WORKER_FAULT_SLEEP_MAX = 900
+worker_faults = {"n": 0}
+# Last state the "nothing is scheduled / paused" notices logged, so the worker
+# can explain a silent gap once per state instead of every sleep chunk.
+schedule_notice = {"key": ""}
 
 # ---------------------------------------------------------------------------
 # Anti-detection: a consistent identity, human-like pacing, rate-limit handling
@@ -3048,50 +3064,119 @@ def _seconds_until_next_run(schedule, tz):
     return max(0.0, (runs[0] - now_local).total_seconds())
 
 
+def note_schedule_state(schedule, paused):
+    # Explain a silent gap ONCE per state. Without this the worker waits, logs
+    # nothing, and a missing run leaves the user with no trace to act on - the
+    # Schedule card is the only thing that says "none scheduled".
+    if paused:
+        key = "paused"
+        message = ("Paused: the sync worker waits and no cycle will start "
+                   "until the switch is turned off")
+    else:
+        reasons = []
+        if not schedule["days"]:
+            reasons.append("no schedule_days selected")
+        if not schedule["times"]:
+            reasons.append("no schedule_times parsed "
+                           "(only 'HH:MM' or 'H' tokens count)")
+        if not reasons:
+            return
+        key = "nothing-scheduled:" + "|".join(reasons)
+        message = "Nothing is scheduled: " + "; ".join(reasons)
+    if schedule_notice["key"] == key:
+        return
+    schedule_notice["key"] = key
+    log.warning(message)
+
+
+def swallowed_slots(schedule, tz, cycle_start, cycle_end):
+    # Daily-mode slots that passed while the worker was still inside this cycle.
+    # The wait loop only looks back SCHEDULE_TICK_SECONDS, so a cycle longer than
+    # the gap between two wall-clock slots silently eats the ones in between;
+    # name them instead of leaving the next run missing with no explanation.
+    if schedule["mode"] != "daily":
+        return []
+    return [r for r in upcoming_runs(schedule, tz, cycle_start, count=8)
+            if cycle_start < r <= cycle_end]
+
+
 def worker():
     # The sync worker is schedule-driven: it re-reads the timezone and schedule
     # settings on every loop iteration and waits in bounded chunks, so edits
     # made on the Settings tab (pause switch, interval, mode, days, times,
     # timezone) take effect without restarting the app.
+    #
+    # The whole loop body sits inside one guard. This thread is started exactly
+    # once at startup, so an exception that escapes the loop body would kill
+    # every future scheduled cycle while the web UI keeps serving - and the
+    # Logs tab would stay empty because the traceback reaches only the
+    # process' stderr. A fault is therefore logged through the app logger
+    # (with the traceback, so the raising line is visible), counted, and backed
+    # off; after WORKER_FAULT_CRITICAL_AFTER consecutive failing ticks a
+    # CRITICAL line says cycles have stopped being scheduled reliably.
     while True:
-        apply_log_level()
-        apply_http_log_setting()
-        apply_ydl_log_setting()
-        if is_paused():
-            # Re-check the flag frequently so an unpause takes effect quickly.
-            time.sleep(PAUSE_POLL_SECONDS)
-            continue
-        schedule = get_schedule()
-        tz = resolve_timezone()
-        wait = _seconds_until_next_run(schedule, tz)
-        if wait is None:
-            # Daily mode with nothing selected: idle, but keep re-reading
-            # settings so a later selection takes effect promptly.
-            time.sleep(IDLE_SCHEDULE_SLEEP)
-            continue
-        if wait > 0:
-            # Sleep at most one chunk; the loop then recomputes the wait with
-            # fresh settings, so schedule/timezone edits apply mid-wait.
-            time.sleep(min(wait, SCHEDULE_TICK_SECONDS))
-            continue
-        # Anchor the interval schedule on the *start* of the cycle so runs stay
-        # evenly spaced even when a sync takes longer than the interval.
-        global last_scheduled_run
-        last_scheduled_run = datetime.now(tz)
-        started = time.monotonic()
         try:
-            ran_cycle = sync_all()
+            apply_log_level()
+            apply_http_log_setting()
+            apply_ydl_log_setting()
+            if is_paused():
+                # Re-check the flag frequently so an unpause takes effect quickly.
+                note_schedule_state(None, paused=True)
+                time.sleep(PAUSE_POLL_SECONDS)
+                continue
+            schedule = get_schedule()
+            tz = resolve_timezone()
+            wait = _seconds_until_next_run(schedule, tz)
+            if wait is None:
+                # Daily mode with nothing selected: idle, but keep re-reading
+                # settings so a later selection takes effect promptly - and say
+                # why, so a run that never starts is not a mystery.
+                note_schedule_state(schedule, paused=False)
+                time.sleep(IDLE_SCHEDULE_SLEEP)
+                continue
+            worker_faults["n"] = 0  # a healthy scheduling tick ends any streak
+            if wait > 0:
+                # Sleep at most one chunk; the loop then recomputes the wait with
+                # fresh settings, so schedule/timezone edits apply mid-wait.
+                time.sleep(min(wait, SCHEDULE_TICK_SECONDS))
+                continue
+            # Anchor the interval schedule on the *start* of the cycle so runs
+            # stay evenly spaced even when a sync takes longer than the interval.
+            global last_scheduled_run
+            last_scheduled_run = datetime.now(tz)
+            cycle_start = last_scheduled_run
+            started = time.monotonic()
+            try:
+                ran_cycle = sync_all()
+            except Exception as exc:
+                report_error("Sync cycle failed", exc)
+                ran_cycle = False
+            elapsed = time.monotonic() - started
+            log.info("Scheduled sync cycle finished in %.0fs", elapsed)
+            # A cycle longer than the gap between two wall-clock slots swallows
+            # the slots in between (the wait loop only looks back one tick) - so
+            # name them instead of leaving the next run missing silently.
+            for slot in swallowed_slots(schedule, tz, cycle_start,
+                                        datetime.now(tz)):
+                log.warning("Skipped the scheduled slot %s: this cycle started at "
+                            "%s and ran %.0fs", fmt_local(slot, tz),
+                            fmt_local(cycle_start, tz), elapsed)
+            # Email the summary only after a cycle that actually RAN: a skipped
+            # cycle (paused, or a manual refresh holding the lock) left the
+            # PREVIOUS cycle's record in place, and re-sending that summary each
+            # tick told the user about downloads on channels that have none.
+            if ran_cycle:
+                maybe_send_cycle_summary_email()
         except Exception as exc:
-            report_error("Sync cycle failed", exc)
-            ran_cycle = False
-        elapsed = time.monotonic() - started
-        log.info("Scheduled sync cycle finished in %.0fs", elapsed)
-        # Email the summary only after a cycle that actually RAN: a skipped
-        # cycle (paused, or a manual refresh holding the lock) left the PREVIOUS
-        # cycle's record in place, and re-sending that summary each tick told
-        # the user about downloads on channels that have none.
-        if ran_cycle:
-            maybe_send_cycle_summary_email()
+            worker_faults["n"] += 1
+            log.exception("Sync worker fault (%d in a row; the worker stays alive "
+                          "and re-computes the schedule): %s", worker_faults["n"], exc)
+            if worker_faults["n"] == WORKER_FAULT_CRITICAL_AFTER:
+                log.critical("Sync worker has faulted %d ticks in a row - cycles "
+                             "are not being scheduled; the ERROR line above names "
+                             "the raising line", worker_faults["n"])
+            time.sleep(min(WORKER_FAULT_SLEEP_MAX,
+                           WORKER_FAULT_SLEEP_BASE * 2 ** min(worker_faults["n"] - 1, 6)))
 
 
 # ---------------------------------------------------------------------------
