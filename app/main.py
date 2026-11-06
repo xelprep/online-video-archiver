@@ -38,7 +38,7 @@ from yt_dlp.utils import LazyList, PagedList  # extractor info dicts hold format
 # YoutubeDL(params) constructor does not. Same import path the CLI uses.
 from yt_dlp.networking.impersonate import ImpersonateTarget
 
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.15.1"
 # Wall-clock time the process started; used to report uptime in the UI.
 START_TIME = time.time()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -305,14 +305,37 @@ app.config.update(
 lock = threading.Lock()
 
 
+# How long sqlite waits for a lock another connection already holds, in ms.
+# Contention is real and routine: a sync cycle keeps a connection open across
+# yt-dlp's downloads (many seconds), while the worker re-reads settings at the
+# top of every loop tick, the manual-refresh thread opens its own, and the UI
+# polls /api/schedule -> get_schedule -> get_setting on a timer. /data is a
+# Synology bind mount, where lock handover is slower than a local filesystem.
+DB_BUSY_TIMEOUT_MS = 10000
+
+
 @contextlib.contextmanager
 def db():
     # The sqlite3 connection context manager commits/rolls back but does not
     # close; wrap it so the connection is always closed on exit.
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=10000")
+    # Order matters. busy_timeout has to be in effect BEFORE the first
+    # statement that needs a lock: with the journal PRAGMA first it ran with a
+    # zero timeout and raised sqlite3.OperationalError("database is locked")
+    # the instant another connection held the lock. That escaped get_setting
+    # -> apply_log_level at the top of the worker loop and killed the sync
+    # worker thread (one daemon thread, started once), so every later
+    # scheduled cycle silently stopped.
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        # journal_mode is a property of the database FILE, so failing to
+        # re-assert it on a connection that only needs read access is not a
+        # fault: an already-WAL database keeps working, and the connection
+        # that gets the exclusive lock re-asserts it.
+        log.debug("could not re-assert journal_mode (kept as set): %s", exc)
     try:
         with conn:
             yield conn
