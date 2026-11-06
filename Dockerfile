@@ -24,8 +24,7 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Explicitly install nightly yt-dlp so any addiitonal requirements can remain regular releases
-RUN pip install --no-cache-dir -U --pre yt-dlp[default,curl-cffi]
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir -U --pre yt-dlp[default,curl-cffi] && pip install --no-cache-dir -r requirements.txt
 
 # Copy the *contents* of app/ into /app so main.py lands at /app/main.py.
 # (Also brings in entrypoint.sh and dnsmasq.conf.)
